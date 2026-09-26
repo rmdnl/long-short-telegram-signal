@@ -1,4 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap');
 
 :root{
   --bg:#07090d;
@@ -58,19 +57,19 @@ body:before{
   font-size:19px;
 }
 .brand-name{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:13px;font-weight:700;letter-spacing:.09em;
 }
 .brand-sub{
   margin-top:4px;
   color:var(--dim);
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:8px;letter-spacing:.11em;
 }
 .top-actions{
   display:flex;align-items:center;gap:9px;
   color:var(--muted);
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:9px;
 }
 .clock{color:#c4ccd5}
@@ -90,7 +89,7 @@ body:before{
 }
 .eyebrow,.panel-kicker,.metric-label{
   color:var(--muted);
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:9px;
   letter-spacing:.11em;
   font-weight:700;
@@ -118,7 +117,7 @@ h1{
   color:#aeb8c2;
   padding:7px 10px;
   border-radius:999px;
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:8px;
   letter-spacing:.04em;
 }
@@ -151,7 +150,7 @@ h1{
   margin-top:11px;
 }
 .metric-meta{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:7px;color:#65717d;margin-top:8px;
 }
 .metric-status .metric-value{
@@ -174,7 +173,7 @@ h2{
 }
 .panel-count{
   color:var(--muted);
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:8px;
 }
 
@@ -193,11 +192,11 @@ h2{
 }
 .symbol-top{display:flex;align-items:center;justify-content:space-between}
 .symbol{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:10px;font-weight:700;letter-spacing:.015em
 }
 .direction{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:7px;padding:4px 6px;border-radius:5px;
   border:1px solid #2b3540;color:#7d8995
 }
@@ -213,7 +212,7 @@ h2{
 .symbol-score.good{color:var(--cyan)}
 .symbol-score.na{color:#46515c}
 .symbol-sub{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:7px;color:#65717d;margin-top:3px
 }
 .symbol-bars{display:flex;gap:3px;margin-top:13px}
@@ -246,7 +245,7 @@ h2{
 .outcome-grid span{
   display:block;
   color:#65717d;
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:7px;margin-top:4px
 }
 
@@ -259,20 +258,20 @@ h2{
   border-bottom:1px solid #1b232c
 }
 .signal-row:last-child{border-bottom:0}
-.signal-symbol{font-family:"Space Mono",monospace;font-weight:700;font-size:10px}
+.signal-symbol{font-family:Inter,ui-sans-serif,system-ui,sans-serif;font-weight:700;font-size:10px}
 .signal-time{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:7px;color:#65717d;margin-top:4px
 }
 .signal-dir{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:8px;font-weight:700;padding:5px 7px;border-radius:5px
 }
 .signal-dir.long{color:var(--green);background:rgba(99,230,160,.07)}
 .signal-dir.short{color:var(--red);background:rgba(255,102,117,.07)}
 .signal-score{font-size:21px;font-weight:700;letter-spacing:-.03em}
 .signal-meta{
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:7px;color:#65717d
 }
 .empty-state{
@@ -281,14 +280,14 @@ h2{
   gap:8px;color:#687582;text-align:center;padding:30px
 }
 .empty-state strong{font-size:19px;font-weight:700;color:#b1bac3}
-.empty-state span{font-family:"Space Mono",monospace;font-size:8px}
+.empty-state span{font-family:Inter,ui-sans-serif,system-ui,sans-serif;font-size:8px}
 .empty-icon{font-size:28px;color:#3d4853}
 
 .footer-strip{
   display:flex;flex-wrap:wrap;gap:7px;
   margin-top:13px;
   color:#5d6975;
-  font-family:"Space Mono",monospace;
+  font-family:Inter,ui-sans-serif,system-ui,sans-serif;
   font-size:7px;letter-spacing:.04em
 }
 .footer-strip span:not(.footer-right){
@@ -326,3 +325,4 @@ h2{
   .metrics-grid{grid-template-columns:1fr 1fr}
   .metric:nth-child(n+5){display:none}
 }
+
