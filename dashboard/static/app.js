@@ -103,12 +103,13 @@ function renderSymbols(payload) {
   }
 
   grid.innerHTML = symbols.map(s => {
-    const symbol = s.symbol || s.name || "--";
-    const dir = String(s.direction || s.side || "").toUpperCase();
-    const score = s.score == null ? null : Number(s.score);
+    const isString = typeof s === "string";
+    const symbol = isString ? s : (s?.symbol || s?.name || "--");
+    const dir = String(isString ? "" : (s?.direction || s?.side || "")).toUpperCase();
+    const score = isString ? null : (s?.score == null ? null : Number(s.score));
     const scoreText = Number.isFinite(score) ? Math.round(score) : "—";
-    const bias = s.htf_bias || s.bias || "—";
-    const status = s.status || s.setup || "WAIT";
+    const bias = isString ? "WAIT" : (s?.htf_bias || s?.bias || "—");
+    const status = isString ? "WAIT" : (s?.status || s?.setup || "WAIT");
     const bars = Math.max(0, Math.min(5, Math.round((safeNumber(score) / 100) * 5)));
     return `
       <div class="symbol-card">
