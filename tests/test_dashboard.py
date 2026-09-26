@@ -153,7 +153,14 @@ def test_get_root(monkeypatch, tmp_path):
     _, client, _, _ = _pingable_testapp(tmp_path, monkeypatch)
     r = client.get("/")
     assert r.status_code == 200
-    assert "LONG / SHORT SIGNAL MONITOR" in r.text
+    # Dashboard V2/V3 shell. Tracks the current intentional title/branding
+    # (brand "SIGNAL//ROOM", hero "Signal Room"). Update these together with
+    # dashboard/templates/index.html if the shell copy is redesigned.
+    assert "Long / Short Signal Monitor" in r.text
+    assert "SIGNAL//ROOM" in r.text
+    assert "Signal Room" in r.text
+    assert "/static/style.css" in r.text
+    assert "/static/app.js" in r.text
 
 def test_get_api_health(monkeypatch, tmp_path):
     _, client, _, _ = _pingable_testapp(tmp_path, monkeypatch)
