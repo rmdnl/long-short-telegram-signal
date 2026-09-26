@@ -1,145 +1,143 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#090b0f">
   <title>Long / Short Signal Monitor</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <!-- Error banner -->
-  <div id="error-banner" class="error-banner hidden">
-    ⚠️ Dashboard data unavailable
-    <button onclick="this.parentElement.classList.add('hidden')" aria-label="Close">✕</button>
-  </div>
+  <div class="noise"></div>
 
-  <!-- Header -->
-  <header class="header">
-    <div class="header-title">
-      <h1>LONG / SHORT SIGNAL MONITOR</h1>
-      <p class="header-sub">Binance Market Intelligence &bull; Signal Only</p>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark"><span>↗</span></div>
+      <div>
+        <div class="brand-name">SIGNAL//ROOM</div>
+        <div class="brand-sub">LONG / SHORT MONITOR</div>
+      </div>
     </div>
-    <div class="header-badges">
-      <span class="badge badge-activity" id="badge-bot-status">🟢 BOT ACTIVITY</span>
-      <span class="badge badge-blue">🛡 SIGNAL ONLY</span>
-      <span class="badge badge-blue">📡 TELEGRAM</span>
-      <span class="badge badge-dark" id="badge-telegram-status">DISABLED</span>
+    <div class="top-actions">
+      <span id="clock" class="clock">--:--:--</span>
+      <span id="connection-dot" class="connection-dot"></span>
+      <span id="connection-label">LIVE</span>
     </div>
   </header>
 
-  <!-- Security banner -->
-  <div class="security-banner">
-    🛡 <strong>SIGNAL ONLY</strong> &mdash; NO AUTO TRADING &bull; NO ORDER EXECUTION
-  </div>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <div class="eyebrow">MARKET SIGNAL TERMINAL</div>
+        <h1>Signal Room</h1>
+        <p>Multi-timeframe crypto scanner · signal only · no order execution</p>
+      </div>
+      <div class="hero-badges">
+        <span class="pill pill-live"><i></i> <span id="hero-status">ONLINE</span></span>
+        <span class="pill">5M TRIGGER</span>
+        <span class="pill">MIN SCORE <b id="min-score">75</b></span>
+      </div>
+    </section>
 
-  <!-- Summary cards -->
-  <section class="summary-cards" id="summary-cards">
-    <div class="card card-sm"><span class="card-label">BOT STATUS</span><span class="card-value" id="card-bot-status">N/A</span></div>
-    <div class="card card-sm"><span class="card-label">UPTIME</span><span class="card-value" id="card-uptime">N/A</span></div>
-    <div class="card card-sm"><span class="card-label">LAST SCAN</span><span class="card-value" id="card-last-scan">N/A</span></div>
-    <div class="card card-sm"><span class="card-label">NEXT EXPECTED</span><span class="card-value" id="card-next-scan">N/A</span></div>
-    <div class="card card-sm"><span class="card-label">TELEGRAM</span><span class="card-value" id="card-telegram">N/A</span></div>
-    <div class="card card-sm"><span class="card-label">DATABASE</span><span class="card-value" id="card-database">N/A</span></div>
-    <div class="card card-sm"><span class="card-label">TOTAL SIGNALS</span><span class="card-value" id="card-total-signals">N/A</span></div>
-    <div class="card card-sm"><span class="card-label">ACTIVE SIGNALS</span><span class="card-value" id="card-active-signals">N/A</span></div>
-  </section>
+    <section class="metrics-grid">
+      <article class="metric metric-status">
+        <div class="metric-label">BOT STATUS</div>
+        <div class="metric-value"><span class="status-dot"></span><span id="bot-status">ONLINE</span></div>
+        <div class="metric-meta" id="bot-cycle">CYCLE --</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">UPTIME</div>
+        <div class="metric-value" id="uptime">--</div>
+        <div class="metric-meta">runtime</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">LAST SCAN</div>
+        <div class="metric-value" id="last-scan">--</div>
+        <div class="metric-meta" id="last-scan-meta">waiting</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">NEXT SCAN</div>
+        <div class="metric-value" id="next-scan">--</div>
+        <div class="metric-meta">~60 sec cadence</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">TELEGRAM</div>
+        <div class="metric-value" id="telegram">--</div>
+        <div class="metric-meta">delivery</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">DATABASE</div>
+        <div class="metric-value" id="database">--</div>
+        <div class="metric-meta">read-only monitor</div>
+      </article>
+    </section>
 
-  <!-- Symbol matrix -->
-  <section class="panel">
-    <h2 class="panel-title">DYNAMIC SYMBOL MATRIX</h2>
-    <p class="panel-note">Symbol list sourced from bot configuration — never hardcoded</p>
-    <div class="matrix-wrap">
-      <table class="matrix" id="symbol-matrix">
-        <thead>
-          <tr>
-            <th>Symbol</th><th>Direction</th><th>Score</th>
-            <th>HTF Bias</th><th>ADX</th><th>RSI</th>
-            <th>Volume Ratio</th><th>Status</th><th>Signal Time</th>
-          </tr>
-        </thead>
-        <tbody id="symbol-matrix-body"></tbody>
-      </table>
-    </div>
-  </section>
+    <section class="dashboard-grid">
+      <div class="panel panel-wide">
+        <div class="panel-head">
+          <div>
+            <span class="panel-kicker">LIVE TAPE</span>
+            <h2>Symbol Matrix</h2>
+          </div>
+          <span class="panel-count" id="symbol-count">0 / 0</span>
+        </div>
+        <div class="matrix-wrap">
+          <div id="symbol-grid" class="symbol-grid"></div>
+        </div>
+      </div>
 
-  <!-- Signal feed -->
-  <section class="panel">
-    <h2 class="panel-title">LATEST SIGNAL FEED</h2>
-    <div class="signal-feed" id="signal-feed"></div>
-  </section>
+      <aside class="side-stack">
+        <div class="panel compact-panel">
+          <div class="panel-head">
+            <div>
+              <span class="panel-kicker">TELEGRAM</span>
+              <h2>Delivery</h2>
+            </div>
+          </div>
+          <div class="delivery-row"><span>Delivered</span><strong id="delivered">0</strong></div>
+          <div class="delivery-row"><span>Failed</span><strong id="failed">0</strong></div>
+          <div class="delivery-bar"><span id="delivery-bar"></span></div>
+        </div>
 
-  <!-- Outcome monitor -->
-  <section class="panel">
-    <h2 class="panel-title">OUTCOME MONITOR</h2>
-    <div class="outcome-cards" id="outcome-cards">
-      <div class="card card-sm card-active"><span class="card-label">ACTIVE</span><span class="card-value" id="oc-active">0</span></div>
-      <div class="card card-sm card-tp1"><span class="card-label">TP1 HIT</span><span class="card-value" id="oc-tp1">0</span></div>
-      <div class="card card-sm card-tp2"><span class="card-label">TP2 HIT</span><span class="card-value" id="oc-tp2">0</span></div>
-      <div class="card card-sm card-stopped"><span class="card-label">STOPPED</span><span class="card-value" id="oc-stopped">0</span></div>
-      <div class="card card-sm card-expired"><span class="card-label">EXPIRED</span><span class="card-value" id="oc-expired">0</span></div>
-    </div>
-    <h3 class="panel-subtitle">Latest Outcome Events</h3>
-    <div class="activity-feed" id="outcome-events"></div>
-  </section>
+        <div class="panel compact-panel">
+          <div class="panel-head">
+            <div>
+              <span class="panel-kicker">OUTCOMES</span>
+              <h2>Tracker</h2>
+            </div>
+          </div>
+          <div class="outcome-grid">
+            <div><b id="tp1">0</b><span>TP1</span></div>
+            <div><b id="tp2">0</b><span>TP2</span></div>
+            <div><b id="stopped">0</b><span>SL</span></div>
+            <div><b id="expired">0</b><span>EXP</span></div>
+          </div>
+        </div>
+      </aside>
+    </section>
 
-  <!-- Delivery health -->
-  <section class="panel">
-    <h2 class="panel-title">DELIVERY HEALTH</h2>
-    <div class="delivery-cards" id="delivery-cards">
-      <div class="card card-sm card-tp2"><span class="card-label">DELIVERED</span><span class="card-value" id="dh-delivered">0</span></div>
-      <div class="card card-sm card-tp1"><span class="card-label">PENDING</span><span class="card-value" id="dh-pending">0</span></div>
-      <div class="card card-sm card-stopped"><span class="card-label">FAILED</span><span class="card-value" id="dh-failed">0</span></div>
-      <div class="card card-sm card-active"><span class="card-label">RETRY ATTEMPTS</span><span class="card-value" id="dh-retries">0</span></div>
-    </div>
-    <div class="error-list" id="delivery-errors"></div>
-  </section>
+    <section class="panel feed-panel">
+      <div class="panel-head">
+        <div>
+          <span class="panel-kicker">EVENT STREAM</span>
+          <h2>Latest Signals</h2>
+        </div>
+        <span class="live-tag"><i></i> AUTO REFRESH</span>
+      </div>
+      <div id="signal-feed" class="signal-feed">
+        <div class="empty-state">
+          <div class="empty-icon">⌁</div>
+          <strong>No signals yet</strong>
+          <span>The scanner is running. Waiting for a setup to qualify.</span>
+        </div>
+      </div>
+    </section>
 
-  <!-- Outcome reliability -->
-  <section class="panel">
-    <h2 class="panel-title">OUTCOME RELIABILITY</h2>
-    <div class="reliability-grid" id="reliability-grid">
-      <div class="stat"><span class="stat-label">Outcome Attempts</span><span class="stat-value" id="or-attempts">N/A</span></div>
-      <div class="stat"><span class="stat-label">TP1 Attempts</span><span class="stat-value" id="or-tp1">N/A</span></div>
-      <div class="stat"><span class="stat-label">TP2 Attempts</span><span class="stat-value" id="or-tp2">N/A</span></div>
-      <div class="stat"><span class="stat-label">SL Attempts</span><span class="stat-value" id="or-sl">N/A</span></div>
-      <div class="stat"><span class="stat-label">Last Outcome Error</span><span class="stat-value" id="or-error">N/A</span></div>
-      <div class="stat"><span class="stat-label">Last Evaluated Candle</span><span class="stat-value" id="or-evaluated">N/A</span></div>
-    </div>
-  </section>
-
-  <!-- Statistics -->
-  <section class="panel">
-    <h2 class="panel-title">PERFORMANCE STATISTICS</h2>
-    <div class="reliability-grid" id="stats-grid">
-      <div class="stat"><span class="stat-label">Total Signals</span><span class="stat-value" id="st-total">0</span></div>
-      <div class="stat"><span class="stat-label">Long Signals</span><span class="stat-value long-color" id="st-long">0</span></div>
-      <div class="stat"><span class="stat-label">Short Signals</span><span class="stat-value short-color" id="st-short">0</span></div>
-      <div class="stat"><span class="stat-label">Active</span><span class="stat-value" id="st-active">0</span></div>
-      <div class="stat"><span class="stat-label">TP1 Hit</span><span class="stat-value" id="st-tp1">0</span></div>
-      <div class="stat"><span class="stat-label">TP2 Hit</span><span class="stat-value" id="st-tp2">0</span></div>
-      <div class="stat"><span class="stat-label">Stopped</span><span class="stat-value" id="st-stopped">0</span></div>
-      <div class="stat"><span class="stat-label">Expired</span><span class="stat-value" id="st-expired">0</span></div>
-      <div class="stat"><span class="stat-label">Telegram Delivered</span><span class="stat-value" id="st-delivered">0</span></div>
-      <div class="stat"><span class="stat-label">Telegram Failed</span><span class="stat-value" id="st-failed">0</span></div>
-    </div>
-  </section>
-
-  <!-- Score distribution -->
-  <section class="panel">
-    <h2 class="panel-title">SIGNAL SCORE DISTRIBUTION</h2>
-    <div class="distribution" id="score-distribution"></div>
-  </section>
-
-  <!-- Activity timeline -->
-  <section class="panel">
-    <h2 class="panel-title">RECENT ACTIVITY</h2>
-    <div class="activity-feed" id="activity-feed"></div>
-  </section>
-
-  <!-- Footer -->
-  <footer class="footer">
-    <p>Updated <span id="last-updated">—</span> &bull; Auto-refresh: 10s &bull; Dashboard v1.0.0</p>
-  </footer>
+    <section class="footer-strip">
+      <span>EMA 50/200</span><span>ADX 14</span><span>RSI 14</span><span>ATR 14</span><span>VOL SMA 20</span>
+      <span class="footer-right">SIGNAL ONLY · NO AUTO TRADING</span>
+    </section>
+  </main>
 
   <script src="/static/app.js"></script>
 </body>
