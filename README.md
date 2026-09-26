@@ -683,7 +683,7 @@ Project menggunakan automated test suite.
 Validasi terbaru:
 
 ```text
-443 tests passed
+470 tests passed
 1 warning
 ```
 
@@ -708,6 +708,9 @@ Test mencakup antara lain:
 * SQLite migration
 * logger
 * security guard
+* dashboard endpoints (read-only)
+* dashboard dynamic symbols
+* dashboard authentication
 
 Sebelum deployment, test dijalankan dengan:
 
@@ -1007,6 +1010,210 @@ journalctl -u long-short-signal -f
 
 ---
 
+# 📊 Dashboard (Read-Only Monitor)
+
+Dashboard web **monitoring saja** untuk memantau bot yang sedang berjalan.
+
+**Read-only. Bukan bagian dari trading engine.**
+
+## Purpose
+
+```text
+Signal Bot (existing)     →  menghasilkan sinyal, menyimpan ke SQLite
+Dashboard (dashboard/)    →  membaca SQLite, menampilkan status
+```
+
+Dashboard duduk **di samping** bot, bukan di dalamnya.
+
+## Monitoring-Only Architecture
+
+Dashboard **tidak pernah**:
+
+```text
+❌ Binance trading endpoint
+❌ API key / API secret handling
+❌ Order execution
+❌ BUY / SELL / CLOSE / CANCEL / EXECUTE button
+❌ Futures / Margin / Leverage
+❌ Withdrawal
+❌ Mengubah SignalEngine / Scanner / Risk / Indicator / Telegram delivery
+❌ Mengubah .env production
+❌ Auto deploy / git commit / git push
+```
+
+Database dibuka dalam mode **read-only**:
+
+```text
+file:signals.db?mode=ro
+```
+
+Parameterized SQL. Tidak ada `INSERT` / `UPDATE` / `DELETE` / `ALTER` / `DROP`.
+
+## Dynamic Symbol Configuration (PENTING)
+
+Dashboard **tidak punya daftar symbol sendiri**.
+
+Config bot adalah **single source of truth**.
+
+Dashboard membaca `config.symbols` dari sistem konfigurasi bot yang sama.
+
+`.env`:
+
+```env
+SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
+```
+
+Setelah restart/reload, dashboard otomatis menampilkan:
+
+```text
+BTCUSDT
+ETHUSDT
+SOLUSDT
+```
+
+Jika `.env` berubah menjadi:
+
+```env
+SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT
+```
+
+Setelah restart/reload, dashboard otomatis menampilkan 5 symbol tersebut.
+
+**Tidak ada** `DASHBOARD_SYMBOLS`.
+
+**Tidak ada** hardcoded list.
+
+**Tidak perlu edit source code** dashboard saat symbol berubah.
+
+## Database Access
+
+Membaca `signals.db` (SQLite) yang sudah dipakai bot.
+
+Saat DB kosong, kolom lama hilang, atau field outcome `NULL`, dashboard tetap berjalan (menampilkan `N/A`).
+
+Tidak pernah mengubah database.
+
+## Local Startup
+
+```bash
+python -m dashboard.app
+```
+
+Default:
+
+```text
+http://127.0.0.1:8080
+```
+
+## Environment Variables
+
+Dashboard configuration **terpisah** dari trading configuration:
+
+```env
+DASHBOARD_HOST=127.0.0.1
+DASHBOARD_PORT=8080
+DASHBOARD_AUTH_ENABLED=false
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=
+```
+
+Default bind: `127.0.0.1`. **Bukan** `0.0.0.0`.
+
+## Authentication (Optional)
+
+```env
+DASHBOARD_AUTH_ENABLED=true
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=your_strong_password
+```
+
+Jika auth diaktifkan tetapi password kosong → **gagal dengan aman** (tidak start).
+
+## API Endpoints
+
+Semua endpoint `GET` saja, read-only:
+
+```text
+GET /
+GET /api/health
+GET /api/status
+GET /api/symbols
+GET /api/signals
+GET /api/signals/latest
+GET /api/outcomes
+GET /api/summary
+GET /api/activity
+```
+
+`/api/symbols` mengikuti `config.symbols` bot.
+
+## SSH Tunnel
+
+Dashboard tidak perlu dipublikasikan.
+
+```bash
+ssh -L 8080:127.0.0.1:8080 ubuntu@YOUR_SERVER
+```
+
+Lalu buka:
+
+```text
+http://127.0.0.1:8080
+```
+
+## systemd Example
+
+Service **terpisah** dari `long-short-telegram-signal.service`.
+
+```ini
+[Unit]
+Description=Long Short Signal Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/long-short-telegram-signal
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/ubuntu/long-short-telegram-signal/.venv/bin/python -m dashboard.app
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Jangan mengganti service bot yang sudah ada.
+
+Contoh file: `dashboard/dashboard.service.example`.
+
+## Security Model
+
+```text
+                 BINANCE
+                    │
+             Public Market Data
+                    │
+                    ▼
+             SIGNAL ENGINE
+                    │
+                    ▼
+               TELEGRAM
+                    │
+                    ▼
+                 SQLite
+                    │
+                    ▼   (read-only)
+              DASHBOARD
+```
+
+Dashboard adalah **observer**.
+
+Tidak ada jalur dari dashboard ke Binance order.
+
+---
+
 # 📁 Project Structure
 
 Gambaran sederhananya:
@@ -1029,6 +1236,19 @@ long-short-telegram-signal/
 │   ├── signal_store.py
 │   ├── logger.py
 │   └── trading_guard.py
+│
+├── dashboard/
+│   ├── __init__.py
+│   ├── app.py
+│   ├── config.py
+│   ├── db.py
+│   ├── service.py
+│   ├── dashboard.service.example
+│   ├── templates/
+│   │   └── index.html
+│   └── static/
+│       ├── style.css
+│       └── app.js
 │
 ├── tests/
 │

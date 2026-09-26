@@ -1,0 +1,16 @@
+[Unit]
+Description=Long Short Signal Dashboard (read-only monitor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/long-short-telegram-signal
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/ubuntu/long-short-telegram-signal/.venv/bin/python -m dashboard.app
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
