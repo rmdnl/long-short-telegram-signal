@@ -243,11 +243,13 @@ Komponen:
 | Risk / RR    |       5 |
 | **TOTAL**    | **100** |
 
-Minimum signal:
+Minimum signal **default**:
 
 ```text
 MIN_SCORE = 80
 ```
+
+Nilai ini dapat diubah melalui environment configuration.
 
 Jadi:
 
@@ -475,6 +477,60 @@ Market tidak peduli kayaknya. 😭
 
 ---
 
+# 🔄 Outcome Monitoring Reliability
+
+Outcome monitor memiliki mekanisme **catch-up** untuk membantu melanjutkan monitoring setelah downtime atau ketika proses sebelumnya belum mengevaluasi seluruh candle yang relevan.
+
+Window monitoring tetap mengikuti:
+
+```text
+SIGNAL_MAX_AGE_HOURS = 48
+```
+
+Data candle diambil menggunakan pagination Binance Public Market Data sehingga monitoring tidak bergantung pada satu fetch kecil saja.
+
+Alurnya:
+
+```text
+Signal
+  ↓
+Outcome monitor
+  ↓
+48h monitoring window
+  ↓
+Paginated candle fetch
+  ↓
+Chronological evaluation
+  ↓
+TP1 / TP2 / SL
+```
+
+Cursor hanya dimajukan setelah candle berhasil dievaluasi.
+
+Jika evaluasi mengalami kegagalan:
+
+```text
+Fetch / evaluation gagal
+        ↓
+Cursor tidak maju
+        ↓
+Candle tetap dapat dicoba kembali
+```
+
+Outcome retry juga dipisahkan berdasarkan level:
+
+```text
+TP1 attempts
+TP2 attempts
+SL attempts
+```
+
+Jadi jika retry TP1 sudah habis, monitoring TP2 dan SL **tidak otomatis ikut berhenti**.
+
+Batas monitoring tetap mengikuti `SIGNAL_MAX_AGE_HOURS`. Signal yang sudah berada di luar TTL tidak dikejar tanpa batas.
+
+---
+
 # 🗄️ SQLite = Source of Truth
 
 SQLite digunakan untuk menyimpan state penting seperti:
@@ -488,6 +544,7 @@ SQLite digunakan untuk menyimpan state penting seperti:
 * SL hit
 * timestamps
 * replay cursor
+* outcome retry attempts
 * startup metadata
 * cooldown state
 
@@ -578,41 +635,6 @@ Tidak ada klaim "exactly once" absolut.
 
 ---
 
-# ⏳ Signal TTL & Outcome Monitoring
-
-Signal memiliki:
-
-```text
-SIGNAL_MAX_AGE_HOURS = 48
-```
-
-Namun fetch window outcome monitor saat ini:
-
-```text
-300 × 5M candles
-```
-
-Secara waktu:
-
-```text
-300 × 5 menit
-= 1.500 menit
-= 25 jam
-```
-
-Jadi terdapat gap antara:
-
-```text
-Signal TTL = 48 jam
-Fetch window = 25 jam
-```
-
-Ini adalah **known limitation**.
-
-Jangan disulap menjadi fitur hanya karena README ingin terlihat ganteng. 😎
-
----
-
 # 🔐 Security Boundary
 
 Bot ini sengaja dibangun sebagai **signal-only system**.
@@ -658,10 +680,11 @@ Karena memang tidak dibuat.
 
 Project menggunakan automated test suite.
 
-Validasi terbaru yang digunakan dalam pengembangan:
+Validasi terbaru:
 
 ```text
-421 tests passed
+443 tests passed
+1 warning
 ```
 
 Test mencakup antara lain:
@@ -679,7 +702,10 @@ Test mencakup antara lain:
 * Telegram delivery
 * retry handling
 * outcome monitor
+* outcome catch-up
+* per-level outcome retry
 * SQLite persistence
+* SQLite migration
 * logger
 * security guard
 
@@ -832,6 +858,8 @@ Cooldown       = 3 trigger candles
 ```
 
 Parameter dapat dikontrol melalui konfigurasi environment/project.
+
+**Catatan:** nilai di atas adalah default/reference configuration. Production environment dapat melakukan override melalui `.env`.
 
 ---
 
@@ -1059,9 +1087,17 @@ Saat ini delivery diarahkan ke satu Chat ID.
 
 Ada kemungkinan duplicate notification yang sangat jarang jika process crash tepat setelah Telegram sukses tetapi sebelum SQLite mencatat state.
 
-### 4. Outcome fetch window
+### 4. Outcome monitoring TTL
 
-Signal TTL adalah 48 jam, sementara fetch window saat ini sekitar 25 jam.
+Outcome monitor melakukan catch-up terhadap candle tertutup dalam window hingga TTL signal.
+
+Monitoring tetap dibatasi oleh:
+
+```text
+SIGNAL_MAX_AGE_HOURS = 48
+```
+
+Signal yang sudah berada di luar TTL tidak dikejar tanpa batas.
 
 ### 5. No message editing / recall
 
@@ -1151,6 +1187,8 @@ Cooldown                 ✅
 SQLite Persistence       ✅
 Telegram Delivery        ✅
 Outcome Monitor          ✅
+Outcome Catch-up         ✅
+Per-Level Retry          ✅
 Security Guard           ✅
 Automated Tests          ✅
 VPS Deployment           ✅
@@ -1162,7 +1200,7 @@ Auto Trading              ❌
 
 Status saat ini:
 
-> **Production signal bot dengan V2 candidate yang sudah divalidasi secara teknis, tetapi belum terbukti memiliki profitabilitas yang konsisten.**
+> **Production signal bot dengan V2 candidate yang sudah divalidasi secara teknis, outcome monitoring yang lebih tahan terhadap downtime, tetapi belum terbukti memiliki profitabilitas yang konsisten.**
 
 ---
 
