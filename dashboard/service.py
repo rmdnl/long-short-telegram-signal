@@ -319,14 +319,14 @@ def build_score_distribution(
 ) -> list[dict]:
     """Format score buckets for the frontend."""
     labels = ["0-59", "60-69", "70-79", "80-89", "90-100"]
-    total = sum(int(distribution.get(l, 0)) for l in labels)
+    total = sum(_safe_int(distribution.get(l, 0)) for l in labels)
     if total == 0:
         return []
     return [
         {
             "label": label,
-            "count": int(distribution.get(label, 0)),
-            "pct": round(int(distribution.get(label, 0)) / total * 100),
+            "count": _safe_int(distribution.get(label, 0)),
+            "pct": round(_safe_int(distribution.get(label, 0)) / total * 100),
         }
         for label in labels
     ]

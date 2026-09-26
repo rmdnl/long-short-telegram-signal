@@ -503,3 +503,173 @@ def test_existing_bot_behavior_unaffected(tmp_path):
         assert "@app.patch" not in text
     finally:
         cfgmod.config = orig
+
+
+# ----------------------------------------------------------------------
+# Score distribution NULL / None handling (regression for TypeError: int(None))
+# ----------------------------------------------------------------------
+
+def test_score_distribution_none_value(monkeypatch, tmp_path):
+    """build_score_distribution must not raise TypeError when a value is None."""
+    from dashboard.service import build_score_distribution
+    dist = {"0-59": None, "60-69": 0, "70-79": 0, "80-89": 0, "90-100": 0}
+    result = build_score_distribution(dist)
+    # All zeros after coercion → empty list
+    assert result == []
+
+
+def test_score_distribution_multiple_none_values(monkeypatch, tmp_path):
+    """Multiple None values must all coerce to 0."""
+    from dashboard.service import build_score_distribution
+    dist = {"0-59": None, "60-69": None, "70-79": None, "80-89": None, "90-100": None}
+    result = build_score_distribution(dist)
+    assert result == []
+
+
+def test_score_distribution_missing_label(monkeypatch, tmp_path):
+    """Missing label keys must coerce to 0 via default."""
+    from dashboard.service import build_score_distribution
+    dist = {"80-89": 5}  # only one bucket present
+    result = build_score_distribution(dist)
+    assert len(result) == 5
+    counts = {r["label"]: r["count"] for r in result}
+    assert counts["80-89"] == 5
+    assert counts["0-59"] == 0
+    assert counts["90-100"] == 0
+
+
+def test_score_distribution_valid_numeric(monkeypatch, tmp_path):
+    """Valid integer counts produce correct percentages."""
+    from dashboard.service import build_score_distribution
+    dist = {"0-59": 10, "60-69": 20, "70-79": 30, "80-89": 25, "90-100": 15}
+    result = build_score_distribution(dist)
+    assert len(result) == 5
+    total = sum(r["count"] for r in result)
+    assert total == 100
+    for r in result:
+        assert 0 <= r["pct"] <= 100
+
+
+def test_score_distribution_empty(monkeypatch, tmp_path):
+    """Empty distribution dict returns empty list."""
+    from dashboard.service import build_score_distribution
+    assert build_score_distribution({}) == []
+
+
+def test_score_distribution_mixed_none_and_valid(monkeypatch, tmp_path):
+    """Mix of None and valid values — None treated as zero."""
+    from dashboard.service import build_score_distribution
+    dist = {"0-59": None, "60-69": 3, "70-79": None, "80-89": 7, "90-100": None}
+    result = build_score_distribution(dist)
+    assert len(result) == 5
+    counts = {r["label"]: r["count"] for r in result}
+    assert counts["0-59"] == 0
+    assert counts["60-69"] == 3
+    assert counts["70-79"] == 0
+    assert counts["80-89"] == 7
+    assert counts["90-100"] == 0
+    # total = 10, pct for 80-89 should be 70
+    pct_80 = next(r["pct"] for r in result if r["label"] == "80-89")
+    assert pct_80 == 70
+
+
+def test_score_distribution_none_does_not_raise_int_none():
+    """Verify int(None) would fail but _safe_int(None) returns 0."""
+    from dashboard.service import _safe_int
+    with pytest.raises(TypeError):
+        int(None)
+    assert _safe_int(None) == 0
+    assert _safe_int(None, 0) == 0
+
+
+def test_summary_with_null_score_distribution(monkeypatch, tmp_path):
+    """End-to-end: /api/summary returns 200 when score bucket sums are NULL.
+
+    SQLite SUM() returns NULL when the table has no rows to aggregate, so
+    score_distribution() yields {label: None}. Before the fix this raised
+    TypeError: int() argument must be ... not 'NoneType' -> HTTP 500.
+    """
+    _, client, db_path, _ = _pingable_testapp(tmp_path, monkeypatch)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE signals (
+            signal_id TEXT PRIMARY KEY, symbol TEXT, direction TEXT,
+            signal_type TEXT, created_at TEXT, trigger_candle_time TEXT,
+            entry_low TEXT, entry_high TEXT, stop_loss TEXT, tp1 TEXT, tp2 TEXT,
+            score INTEGER, htf_bias TEXT, adx_value TEXT, rsi_value TEXT,
+            volume_ratio TEXT, status TEXT,
+            tp1_hit_time TEXT, tp2_hit_time TEXT, sl_hit_time TEXT,
+            expiration_time TEXT, delivery_status TEXT, delivery_attempts INTEGER,
+            last_delivery_error TEXT,
+            tp1_notified INTEGER DEFAULT 0, tp2_notified INTEGER DEFAULT 0,
+            sl_notified INTEGER DEFAULT 0,
+            outcome_attempts INTEGER DEFAULT 0, last_outcome_error TEXT,
+            last_evaluated_candle_time TEXT,
+            tp1_outcome_attempts INTEGER DEFAULT 0,
+            tp2_outcome_attempts INTEGER DEFAULT 0,
+            sl_outcome_attempts INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    # Empty table: every SUM(...) bucket is NULL — the production trigger.
+    r = client.get("/api/summary")
+    assert r.status_code == 200
+    j = r.json()
+    assert "summary" in j
+    assert "distribution" in j
+    # No data → no fabricated buckets
+    assert j["distribution"] == []
+
+    # Also verify /api/status (the endpoint that returned HTTP 500).
+    r2 = client.get("/api/status")
+    assert r2.status_code == 200
+
+
+def test_summary_with_null_score_row(monkeypatch, tmp_path):
+    """End-to-end: a row with NULL score does not break /api/summary."""
+    _, client, db_path, _ = _pingable_testapp(tmp_path, monkeypatch)
+    _seed_db(db_path, [
+        _make_signal_row(0, score=None),
+        _make_signal_row(1, score=84),
+    ])
+    r = client.get("/api/summary")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["summary"]["total_signals"] == 2
+    counts = {b["label"]: b["count"] for b in j["distribution"]}
+    assert counts["80-89"] == 1
+
+
+def test_all_api_endpoints_return_200_with_null_distribution(monkeypatch, tmp_path):
+    """All required API endpoints must return 200 after the fix."""
+    _, client, db_path, _ = _pingable_testapp(tmp_path, monkeypatch)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE signals (
+            signal_id TEXT PRIMARY KEY, symbol TEXT, direction TEXT,
+            signal_type TEXT, created_at TEXT, trigger_candle_time TEXT,
+            entry_low TEXT, entry_high TEXT, stop_loss TEXT, tp1 TEXT, tp2 TEXT,
+            score INTEGER, htf_bias TEXT, adx_value TEXT, rsi_value TEXT,
+            volume_ratio TEXT, status TEXT,
+            tp1_hit_time TEXT, tp2_hit_time TEXT, sl_hit_time TEXT,
+            expiration_time TEXT, delivery_status TEXT, delivery_attempts INTEGER,
+            last_delivery_error TEXT,
+            tp1_notified INTEGER DEFAULT 0, tp2_notified INTEGER DEFAULT 0,
+            sl_notified INTEGER DEFAULT 0,
+            outcome_attempts INTEGER DEFAULT 0, last_outcome_error TEXT,
+            last_evaluated_candle_time TEXT,
+            tp1_outcome_attempts INTEGER DEFAULT 0,
+            tp2_outcome_attempts INTEGER DEFAULT 0,
+            sl_outcome_attempts INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+    for path in ["/api/health", "/api/status", "/api/summary", "/api/symbols",
+                 "/api/signals", "/api/outcomes", "/api/activity"]:
+        r = client.get(path)
+        assert r.status_code == 200, f"{path} returned {r.status_code}"
