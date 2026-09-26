@@ -35,10 +35,31 @@ OUTCOME_MAX_ATTEMPTS = 3
 #: persisted but deliberately silent — the spec only asks for TP1/TP2/SL.
 _NOTIFIED_LEVELS = ("TP1", "TP2", "SL")
 
-#: How many 5M candles to request per active signal. 300 x 5m = 25h of
-#: history, comfortably more than the 48h TTL needs for fresh signals while
-#: staying well inside Binance's 1000-candle limit.
-_FETCH_LIMIT = 300
+#: Maximum candles per Binance API request (hard limit is 1000).
+_BINANCE_MAX_LIMIT = 1000
+
+#: Maximum 5M candles that can cover SIGNAL_MAX_AGE_HOURS (48h * 12 = 576).
+#: We use this as the absolute upper bound for catch-up.
+_MAX_CATCHUP_CANDLES = SIGNAL_MAX_AGE_HOURS * 12  # 576
+
+#: Seconds per outcome candle (monitor is hard-wired to the 5M trigger TF).
+_OUTCOME_TF_SECONDS = 300
+
+#: Hard stop on catch-up paging. With a 1000-candle page the full 48h TTL
+#: (576 candles) resolves in a single request; the bound only exists so a
+#: misbehaving feed can never spin the monitor.
+_MAX_FETCH_PAGES = 8
+
+
+def _catchup_window_start(signal: Signal, now: datetime) -> datetime:
+    """Oldest candle instant the monitor may need for this signal.
+
+    Bounded by the signal TTL so we never request history Binance no longer
+    serves, and floored at ``created_at`` so we never evaluate candles from
+    before the signal existed.
+    """
+    ttl_floor = now - timedelta(hours=SIGNAL_MAX_AGE_HOURS)
+    return max(ttl_floor, signal.created_at)
 
 
 @dataclass(frozen=True)
@@ -83,6 +104,13 @@ def evaluate_signal_outcome(
 
     # 1) Closed-candle cutoff: never evaluate the forming candle.
     closed = cutoff_candles(candles, "5m", now)
+    if not closed:
+        return [], None
+
+    # 1b) Signal-creation floor: never evaluate a candle that opened before
+    #     the signal existed. Guards against replaying pre-signal history
+    #     after a long outage.
+    closed = [c for c in closed if c.timestamp >= signal.created_at]
     if not closed:
         return [], None
 
@@ -251,25 +279,31 @@ Signal only • No auto trading"""
 class OutcomeMonitorRunner:
     """One pass per main loop cycle.
 
-    - Fetches a bounded window of recent 5M candles per symbol.
+    - Pages through 5M candle history from the replay cursor to now,
+      bounded by the signal's TTL, so a long VPS outage never loses
+      outcome-relevant candles.
     - Evaluates every active signal against the closed candles only.
     - Persists state transitions idempotently in SQLite.
     - Sends exactly-once Telegram notifications on state changes.
     - Records a replay cursor so a restart never re-evaluates
       a closed candle.
-    - Caps per-signal outcome-notification attempts (OUTCOME_MAX_ATTEMPTS)
-      so a permanently broken chat cannot produce an infinite loop.
+    - Caps notification attempts per outcome level (TP1 / TP2 / SL)
+      independently, so a permanently broken Telegram delivery for
+      one level never blocks the others.
 
     Fully isolated from the scanner: a monitor failure never aborts
     the scan and a scanner failure never aborts the monitor.
     """
 
-    def __init__(self, store, telegram_bot, market_data=None, now_fn=None):
+    def __init__(self, store, telegram_bot, market_data=None, now_fn=None,
+                 chunk_limit: int = _BINANCE_MAX_LIMIT):
         self.store = store
         self.telegram_bot = telegram_bot
         self.market_data = market_data if market_data is not None else BinanceMarketData()
         # Injectable clock keeps closed-candle cutoff deterministic in tests.
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        # Page size for history catch-up. Bounded by Binance's 1000-candle cap.
+        self._chunk_limit = max(1, min(int(chunk_limit), _BINANCE_MAX_LIMIT))
 
     def run_once(self) -> None:
         """Evaluate all active signals once."""
@@ -283,10 +317,6 @@ class OutcomeMonitorRunner:
 
     def _monitor_one(self, signal: Signal, now: datetime) -> None:
         """Evaluate a single signal and persist/notify any transitions."""
-        # Bounded retry guard for outcome notifications.
-        if self.store.get_outcome_attempts(signal.signal_id) >= OUTCOME_MAX_ATTEMPTS:
-            return
-
         # Snapshot outcome levels that are already persisted but whose
         # notification never landed (Telegram outage, or a crash between
         # persisting the outcome and marking it delivered). The replay
@@ -296,14 +326,14 @@ class OutcomeMonitorRunner:
         # transitions so a level is attempted at most once per cycle.
         pending = self._pending_outcome_levels(signal.signal_id)
 
-        # Fetch a bounded window of recent 5M candles.
-        try:
-            candles = self.market_data.fetch_klines(
-                signal.symbol, "5m", limit=_FETCH_LIMIT)
-        except Exception as e:
-            logger.warning(
-                f"Outcome monitor could not fetch candles for "
-                f"{signal.symbol}: {e}")
+        # Fetch every closed 5M candle needed to bridge the replay gap,
+        # bounded by the signal TTL and paged in Binance-sized chunks.
+        # Returns None when history could not be fetched — the cursor is
+        # then left untouched so no candle is silently skipped.
+        candles = self._fetch_catchup_candles(signal, now)
+        if candles is None:
+            # History unavailable: still retry notifications we already know
+            # are owed, but never advance the cursor.
             self._flush_pending_notifications(signal, pending)
             return
 
@@ -313,19 +343,22 @@ class OutcomeMonitorRunner:
 
         last_cursor = self.store.get_last_evaluated_candle_time(
             signal.signal_id)
-        transitions, new_cursor = evaluate_signal_outcome(
-            signal, candles, last_cursor, now)
+        try:
+            transitions, new_cursor = evaluate_signal_outcome(
+                signal, candles, last_cursor, now)
+        except Exception as e:
+            # Evaluation failure must NOT advance the cursor, otherwise the
+            # unprocessed candles would be lost forever.
+            logger.error(
+                f"Outcome evaluation failed for {signal.signal_id}: {e}",
+                exc_info=True)
+            self._flush_pending_notifications(signal, pending)
+            return
 
         if not transitions and new_cursor:
             # Advance the replay cursor even when nothing changed,
             # so a restart never re-evaluates the same closed candle.
-            try:
-                self.store.set_last_evaluated_candle_time(
-                    signal.signal_id, new_cursor)
-            except Exception as e:
-                logger.error(
-                    f"Failed to persist replay cursor for "
-                    f"{signal.signal_id}: {e}")
+            self._advance_cursor(signal.signal_id, new_cursor)
             # Also retry any previously-persisted but undelivered level
             # (the cursor has moved past its candle, so it can never be
             # re-derived by evaluation).
@@ -338,11 +371,92 @@ class OutcomeMonitorRunner:
         # Retry any level left undelivered by an earlier cycle/restart.
         self._flush_pending_notifications(signal, pending)
 
+    # ------------------------------------------------------------------
+    # Bounded history catch-up
+    # ------------------------------------------------------------------
+    def _fetch_catchup_candles(self, signal: Signal,
+                               now: datetime) -> Optional[List[Candle]]:
+        """Fetch the closed-candle history the replay cursor still needs.
+
+        The window starts at the later of the signal's creation time and the
+        TTL boundary, so we never request candles older than
+        SIGNAL_MAX_AGE_HOURS nor candles from before the signal existed. The
+        window is then walked forward in ``chunk_limit``-sized pages, which
+        keeps us inside Binance's 1000-candle cap while still covering the
+        full 48h TTL after a long outage.
+
+        Returns:
+            Chronologically ordered candles, or None if any page failed.
+            None is a hard stop: the caller must not advance the cursor.
+        """
+        window_start = _catchup_window_start(signal, now)
+        if window_start >= now:
+            return []
+
+        collected: List[Candle] = []
+        seen: set = set()
+        cursor = window_start
+
+        for _ in range(_MAX_FETCH_PAGES):
+            try:
+                batch = self.market_data.fetch_klines(
+                    signal.symbol, "5m",
+                    limit=self._chunk_limit,
+                    start_time=cursor,
+                    end_time=now,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Outcome history fetch failed for {signal.symbol} "
+                    f"at {cursor.isoformat()}: {e}. Replay cursor left "
+                    f"unchanged so no candle is skipped.")
+                return None
+
+            if not batch:
+                break
+
+            added = 0
+            for candle in batch:
+                if candle.timestamp in seen:
+                    continue
+                seen.add(candle.timestamp)
+                collected.append(candle)
+                added += 1
+
+            if added == 0:
+                # No forward progress (duplicate page) — stop rather than loop.
+                break
+
+            if len(batch) < self._chunk_limit:
+                # Short page: Binance has no more history at/after cursor.
+                break
+
+            if len(collected) >= _MAX_CATCHUP_CANDLES:
+                # Hard cap on recovered history (48h of 5M candles).
+                break
+
+            next_cursor = batch[-1].timestamp + timedelta(seconds=_OUTCOME_TF_SECONDS)
+            if next_cursor <= cursor:
+                # Defensive: no progress possible, stop paging.
+                break
+            cursor = next_cursor
+        else:
+            logger.error(
+                f"Outcome history for {signal.symbol} exceeded the "
+                f"{_MAX_FETCH_PAGES}-page catch-up bound; stopping at "
+                f"{cursor.isoformat()}")
+            return None
+
+        collected.sort(key=lambda c: c.timestamp)
+        return collected
+
     def _pending_outcome_levels(self, signal_id: str) -> Tuple[str, ...]:
         """Outcome levels whose hit is persisted but not yet notified.
 
         Derived purely from SQLite state, so it is identical before and
         after a restart. Returned in deterministic TP1 -> TP2 -> SL order.
+        Levels that have exhausted their OWN retry budget are excluded: their
+        budget is independent, so one dead level never blocks the others.
         """
         state = self.store.get_outcome_state(signal_id)
         pairs = (
@@ -353,15 +467,22 @@ class OutcomeMonitorRunner:
         return tuple(
             level for level, hit_col, flag_col in pairs
             if state.get(hit_col) and not state.get(flag_col)
+            and not self._level_retry_exhausted(signal_id, level)
         )
+
+    def _level_retry_exhausted(self, signal_id: str, level: str) -> bool:
+        """True when this level alone has used up its retry budget."""
+        return (self.store.get_outcome_attempts(signal_id, level)
+                >= OUTCOME_MAX_ATTEMPTS)
 
     def _flush_pending_notifications(self, signal: Signal,
                                      pending: Tuple[str, ...]) -> None:
         """Re-attempt Telegram delivery for persisted-but-unnotified levels.
 
         Stops at the first failure so TP1 always precedes TP2 and a broken
-        chat cannot spin through every level in a single pass. The retry
-        budget (OUTCOME_MAX_ATTEMPTS) is enforced by the caller.
+        chat cannot spin through every level in a single pass. Each level is
+        bounded by its own OUTCOME_MAX_ATTEMPTS budget, so an exhausted TP1
+        never prevents a later TP2 or SL from being delivered.
         """
         if not pending:
             return
@@ -370,6 +491,9 @@ class OutcomeMonitorRunner:
             return
 
         for level in pending:
+            if self._level_retry_exhausted(signal.signal_id, level):
+                # Budget for this level is spent; the others may still run.
+                continue
             if not self._send_and_mark(signal, level):
                 return
 
@@ -378,13 +502,15 @@ class OutcomeMonitorRunner:
 
         Returns True when Telegram accepted the message. On failure the
         notification flag is left untouched so the level stays pending and
-        is retried on a later cycle or after a restart.
+        is retried on a later cycle or after a restart, up to this level's
+        own attempt budget.
         """
         try:
             ok = bool(self.telegram_bot.send_outcome(signal, level))
         except Exception as e:
             logger.error(
-                f"Outcome notification raised for {signal.signal_id}: {e}",
+                f"Outcome notification raised for {signal.signal_id} "
+                f"({level}): {e}",
                 exc_info=True)
             ok = False
 
@@ -395,11 +521,12 @@ class OutcomeMonitorRunner:
             return True
 
         attempts = self.store.record_outcome_failure(
-            signal.signal_id, f"outcome_{level}_failed")
+            signal.signal_id, level, f"outcome_{level}_failed")
         if attempts >= OUTCOME_MAX_ATTEMPTS:
             logger.warning(
-                f"Outcome {level} for {signal.signal_id} exhausted "
-                f"retry budget ({attempts}/{OUTCOME_MAX_ATTEMPTS})")
+                f"Outcome {level} for {signal.signal_id} exhausted its own "
+                f"retry budget ({attempts}/{OUTCOME_MAX_ATTEMPTS}); other "
+                f"outcome levels remain eligible")
         return False
 
     def _advance_cursor(self, signal_id: str, cursor) -> bool:
@@ -478,8 +605,9 @@ class OutcomeMonitorRunner:
                 f"Outcome {level} notified for {signal.signal_id}")
         else:
             attempts = self.store.record_outcome_failure(
-                signal.signal_id, f"outcome_{level}_failed")
+                signal.signal_id, level, f"outcome_{level}_failed")
             if attempts >= OUTCOME_MAX_ATTEMPTS:
                 logger.warning(
-                    f"Outcome {level} for {signal.signal_id} exhausted "
-                    f"retry budget ({attempts}/{OUTCOME_MAX_ATTEMPTS})")
+                    f"Outcome {level} for {signal.signal_id} exhausted its own "
+                    f"retry budget ({attempts}/{OUTCOME_MAX_ATTEMPTS}); other "
+                    f"outcome levels remain eligible")

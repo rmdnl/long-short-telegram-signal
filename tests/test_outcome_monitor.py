@@ -18,8 +18,9 @@ import app.main as main_mod
 import app.outcome_monitor as outcome_monitor
 from app.models import (Candle, MarketBias, Signal, SignalDirection,
                         SignalStatus, SignalType)
-from app.outcome_monitor import (OutcomeMonitorRunner, evaluate_signal_outcome,
-                                 format_outcome, format_startup_notification)
+from app.outcome_monitor import (OutcomeMonitorRunner, SIGNAL_MAX_AGE_HOURS,
+                                 evaluate_signal_outcome, format_outcome,
+                                 format_startup_notification)
 from app.signal_filter import generate_signal_id
 from app.signal_store import SignalStore
 from app.telegram_bot import TelegramBot
@@ -621,3 +622,524 @@ class TestNotificationOrdering:
 
         assert store.is_outcome_notified(sig.signal_id, "TP1")
         assert telegram_bot.send_outcome.call_count == 1
+
+
+# ------------------------------------------------------------------
+# PATCH-1 & PATCH-2 regression suite
+# ------------------------------------------------------------------
+
+import bisect
+
+
+def _pageable_candles():
+    """Three closed candles spaced 5m apart."""
+    return [
+        _fake_candle(BASE + timedelta(minutes=10), "101", "109", "108"),
+        _fake_candle(BASE + timedelta(minutes=15), "101", "114", "113"),
+        _fake_candle(BASE + timedelta(minutes=20), "101", "116", "115"),
+    ]
+
+
+def _fake_candle(ts, low, high, close="103"):
+    """Deterministic closed candle for history-paging tests."""
+    return _mk_candle(ts, low, high, close)
+
+
+def _paginating_market_data(all_candles):
+    """MagicMock that slices ``all_candles`` by start_time, capping at limit."""
+    ordered = sorted(all_candles, key=lambda c: c.timestamp)
+    times = [c.timestamp for c in ordered]
+
+    def fetch(symbol, interval, limit, start_time=None, end_time=None, **_kw):
+        idx = 0 if start_time is None else bisect.bisect_left(times, start_time)
+        end_idx = len(ordered) if end_time is None else bisect.bisect_right(times, end_time)
+        return list(ordered[idx:min(idx + limit, end_idx)])
+
+    md = MagicMock()
+    md.fetch_klines.side_effect = fetch
+    return md
+
+
+def _failing_market_data():
+    md = MagicMock()
+    md.fetch_klines.side_effect = RuntimeError("Binance down")
+    return md
+
+
+def _run(runner):
+    try:
+        runner.run_once()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------
+# 1. Long downtime recovery (~30 h)
+# ------------------------------------------------------------------
+class TestLongDowntimeRecovery:
+    def test_tp1_detected_after_30h_downtime(self, tmp_path):
+        """A TP1 candle 30h ago is still detected."""
+        store = SignalStore(db_path=str(tmp_path / "dt.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(hours=30, minutes=10)
+        tp1_c = _fake_candle(now - timedelta(hours=30, minutes=5),
+                             "101", "109", "108")
+        md = MagicMock()
+        md.fetch_klines.return_value = [tp1_c]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        state = store.get_outcome_state(sig.signal_id)
+        assert state["tp1_hit_time"] is not None
+        tb.send_outcome.assert_called()
+        assert tb.send_outcome.call_args[0][1] == "TP1"
+
+    def test_outcome_not_lost_after_30h(self, tmp_path):
+        """Candle 26h ago (>300 x 5m) is still seen."""
+        store = SignalStore(db_path=str(tmp_path / "dt2.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(hours=30)
+        c = _fake_candle(now - timedelta(hours=26), "101", "109", "108")
+        md = MagicMock()
+        md.fetch_klines.return_value = [c]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert tb.send_outcome.call_count >= 1
+        assert tb.send_outcome.call_args[0][1] == "TP1"
+
+
+# ------------------------------------------------------------------
+# 2. TTL boundary
+# ------------------------------------------------------------------
+class TestTTLBoundary:
+    def test_catchup_start_bounded_by_ttl(self, tmp_path):
+        """start_time passed to fetch_klines >= now - TTL."""
+        store = SignalStore(db_path=str(tmp_path / "ttl.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(hours=36)
+        c = _fake_candle(now - timedelta(minutes=10), "101", "109", "108")
+        calls = []
+        def record_fetch(sym, iv, limit, start_time=None, end_time=None, **_kw):
+            calls.append((start_time, end_time))
+            return [c]
+        md = MagicMock()
+        md.fetch_klines.side_effect = record_fetch
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert len(calls) >= 1
+        st, et = calls[0]
+        assert et == now
+        assert st >= now - timedelta(hours=SIGNAL_MAX_AGE_HOURS + 1)
+
+    def test_candles_before_created_at_ignored(self, tmp_path):
+        """Candles earlier than signal.created_at are not evaluated."""
+        store = SignalStore(db_path=str(tmp_path / "pre.db"))
+        sig = _make_signal()
+        sig.created_at = BASE + timedelta(hours=1)
+        _delivered(store, sig)
+        now = BASE + timedelta(hours=1, minutes=30)
+        pre = _fake_candle(BASE + timedelta(minutes=10), "101", "109", "108")
+        md = MagicMock()
+        md.fetch_klines.return_value = [pre]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert tb.send_outcome.call_count == 0
+        assert store.get_outcome_state(sig.signal_id)["tp1_hit_time"] is None
+
+
+# ------------------------------------------------------------------
+# 3. Closed candles only
+# ------------------------------------------------------------------
+class TestClosedCandlesOnly:
+    def test_forming_candle_skipped_in_catchup(self, tmp_path):
+        """A forming candle in the fetch window is never evaluated."""
+        store = SignalStore(db_path=str(tmp_path / "form.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=30)
+        forming = _mk_candle(now, "101", "114", "113")
+        md = MagicMock()
+        md.fetch_klines.return_value = [forming]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert tb.send_outcome.call_count == 0
+
+
+# ------------------------------------------------------------------
+# 4. Replay cursor
+# ------------------------------------------------------------------
+class TestReplayCursor:
+    def test_already_processed_candle_not_evaluated(self, tmp_path):
+        """Candle at/behind the cursor is skipped."""
+        store = SignalStore(db_path=str(tmp_path / "cur.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        c = _fake_candle(BASE + timedelta(minutes=10), "101", "109", "108")
+        store.set_last_evaluated_candle_time(
+            sig.signal_id, c.timestamp + timedelta(seconds=300))
+        md = MagicMock()
+        md.fetch_klines.return_value = [c]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert tb.send_outcome.call_count == 0
+
+
+# ------------------------------------------------------------------
+# 5. Pagination
+# ------------------------------------------------------------------
+class TestPagination:
+    def test_chunks_processed_in_chronological_order(self, tmp_path):
+        """Multiple API pages are merged in chronological order."""
+        store = SignalStore(db_path=str(tmp_path / "page.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        all_c = _pageable_candles()
+        md = _paginating_market_data(all_c)
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now, chunk_limit=1)
+        _run(runner)
+        levels = [c.args[1] for c in tb.send_outcome.call_args_list]
+        assert "TP1" in levels
+        assert "TP2" in levels
+        if "SL" in levels:
+            assert levels.index("TP1") < levels.index("TP2")
+
+    def test_starts_are_non_decreasing(self, tmp_path):
+        """Each successive page start_time >= previous."""
+        store = SignalStore(db_path=str(tmp_path / "ord.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        all_c = _pageable_candles()
+        ordered = sorted(all_c, key=lambda c: c.timestamp)
+        times = [c.timestamp for c in ordered]
+        starts = []
+        def record(sym, iv, limit, start_time=None, **_kw):
+            starts.append(start_time)
+            idx = 0 if start_time is None else bisect.bisect_left(times, start_time)
+            return ordered[idx:idx + limit]
+        md = MagicMock()
+        md.fetch_klines.side_effect = record
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now, chunk_limit=1)
+        _run(runner)
+        for i in range(1, len(starts)):
+            if starts[i] is not None and starts[i - 1] is not None:
+                assert starts[i] >= starts[i - 1]
+
+
+# ------------------------------------------------------------------
+# 6. Cursor failure safety
+# ------------------------------------------------------------------
+class TestCursorFailureSafety:
+    def test_fetch_failure_cursor_not_advanced(self, tmp_path):
+        """Failed fetch leaves cursor untouched."""
+        store = SignalStore(db_path=str(tmp_path / "fc.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        tb = MagicMock()
+        runner = OutcomeMonitorRunner(store, tb,
+                                      market_data=_failing_market_data(),
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert store.get_last_evaluated_candle_time(sig.signal_id) is None
+
+    def test_fetch_failure_allows_recovery(self, tmp_path):
+        """After a transient fetch failure, missed candles are recovered."""
+        store = SignalStore(db_path=str(tmp_path / "rc.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        c = _fake_candle(BASE + timedelta(minutes=10), "101", "109", "108")
+        md_fail = _failing_market_data()
+        md_ok = MagicMock(); md_ok.fetch_klines.return_value = [c]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md_fail,
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert store.get_last_evaluated_candle_time(sig.signal_id) is None
+        runner.market_data = md_ok
+        _run(runner)
+        assert store.get_last_evaluated_candle_time(sig.signal_id) == c.timestamp
+
+
+# ------------------------------------------------------------------
+# 7. TP1 retry isolation
+# ------------------------------------------------------------------
+class TestTP1RetryIsolation:
+    def test_tp1_exhausted_independently(self, tmp_path):
+        """TP1 fails exactly OUTCOME_MAX_ATTEMPTS times then stops."""
+        store = SignalStore(db_path=str(tmp_path / "t1ex.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        md = MagicMock(); md.fetch_klines.return_value = [_tp1_only_candle()]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=False)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        for _ in range(outcome_monitor.OUTCOME_MAX_ATTEMPTS + 5):
+            _run(runner)
+        assert (store.get_outcome_attempts(sig.signal_id, "TP1")
+                == outcome_monitor.OUTCOME_MAX_ATTEMPTS)
+
+
+# ------------------------------------------------------------------
+# 8. TP2 retry independence
+# ------------------------------------------------------------------
+class TestTP2RetryIndependence:
+    def test_tp2_delivered_after_tp1_exhausted(self, tmp_path):
+        """TP2 is delivered even though TP1's retry budget is spent."""
+        store = SignalStore(db_path=str(tmp_path / "t2dep.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        tp1c = _fake_candle(BASE + timedelta(minutes=10), "101", "109", "108")
+        tp2c = _fake_candle(BASE + timedelta(minutes=15), "101", "114", "113")
+        # TP1 hit persisted but never delivered.
+        store.record_outcome(sig.signal_id, SignalStatus.TP1_HIT.value,
+                             tp1_hit_time=tp1c.timestamp + timedelta(seconds=300))
+        store.set_last_evaluated_candle_time(sig.signal_id, tp1c.timestamp)
+        # Burn TP1's entire retry budget.
+        for _ in range(outcome_monitor.OUTCOME_MAX_ATTEMPTS):
+            store.record_outcome_failure(sig.signal_id, "TP1", "boom")
+        assert (store.get_outcome_attempts(sig.signal_id, "TP1")
+                == outcome_monitor.OUTCOME_MAX_ATTEMPTS)
+
+        md = MagicMock(); md.fetch_klines.return_value = [tp1c, tp2c]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        sent = [c.args[1] for c in tb.send_outcome.call_args_list]
+        # TP1 must not be retried (budget spent) but TP2 must be delivered.
+        assert "TP1" not in sent
+        assert "TP2" in sent
+        assert store.is_outcome_notified(sig.signal_id, "TP2")
+
+    def test_tp1_exhaustion_stops_tp1_but_not_tp2_retries(self, tmp_path):
+        """TP2 keeps its own full budget after TP1 is exhausted."""
+        store = SignalStore(db_path=str(tmp_path / "t2bud.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        tp1c = _fake_candle(BASE + timedelta(minutes=10), "101", "109", "108")
+        tp2c = _fake_candle(BASE + timedelta(minutes=15), "101", "114", "113")
+        store.record_outcome(sig.signal_id, SignalStatus.TP1_HIT.value,
+                             tp1_hit_time=tp1c.timestamp + timedelta(seconds=300))
+        store.set_last_evaluated_candle_time(sig.signal_id, tp1c.timestamp)
+        for _ in range(outcome_monitor.OUTCOME_MAX_ATTEMPTS):
+            store.record_outcome_failure(sig.signal_id, "TP1", "boom")
+        # Telegram now works: TP2 must be delivered on the very next cycle.
+        md = MagicMock(); md.fetch_klines.return_value = [tp2c]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        assert store.is_outcome_notified(sig.signal_id, "TP2")
+        assert (store.get_outcome_attempts(sig.signal_id, "TP2")
+                <= outcome_monitor.OUTCOME_MAX_ATTEMPTS)
+
+
+# ------------------------------------------------------------------
+# 9. SL retry independence
+# ------------------------------------------------------------------
+class TestSLRetryIndependence:
+    def test_sl_delivered_after_tp1_exhausted(self, tmp_path):
+        """SL is delivered even though TP1's retry budget is spent."""
+        store = SignalStore(db_path=str(tmp_path / "sldep.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        tp1c = _fake_candle(BASE + timedelta(minutes=10), "101", "109", "108")
+        slc = _fake_candle(BASE + timedelta(minutes=15), "97", "104", "98")
+        store.record_outcome(sig.signal_id, SignalStatus.TP1_HIT.value,
+                             tp1_hit_time=tp1c.timestamp + timedelta(seconds=300))
+        store.set_last_evaluated_candle_time(sig.signal_id, tp1c.timestamp)
+        for _ in range(outcome_monitor.OUTCOME_MAX_ATTEMPTS):
+            store.record_outcome_failure(sig.signal_id, "TP1", "boom")
+        md = MagicMock(); md.fetch_klines.return_value = [tp1c, slc]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        sent = [c.args[1] for c in tb.send_outcome.call_args_list]
+        assert "TP1" not in sent
+        assert "SL" in sent
+        assert store.is_outcome_notified(sig.signal_id, "SL")
+
+
+# ------------------------------------------------------------------
+# 10. Database migration — old schema opens without loss
+# ------------------------------------------------------------------
+class TestDatabaseMigration:
+    def test_old_schema_opens_with_defaults(self, tmp_path):
+        """An older schema (without per-level columns) opens cleanly."""
+        db_path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE signals (
+                signal_id TEXT PRIMARY KEY,
+                symbol TEXT, direction TEXT, signal_type TEXT,
+                created_at TEXT, trigger_candle_time TEXT,
+                entry_low TEXT, entry_high TEXT,
+                stop_loss TEXT, tp1 TEXT, tp2 TEXT,
+                score INTEGER, htf_bias TEXT, adx_value TEXT,
+                rsi_value TEXT, volume_ratio TEXT,
+                status TEXT DEFAULT 'ACTIVE',
+                tp1_hit_time TEXT, tp2_hit_time TEXT, sl_hit_time TEXT,
+                tp1_notified INTEGER NOT NULL DEFAULT 0,
+                tp2_notified INTEGER NOT NULL DEFAULT 0,
+                sl_notified INTEGER NOT NULL DEFAULT 0,
+                outcome_attempts INTEGER NOT NULL DEFAULT 0,
+                last_outcome_error TEXT,
+                last_evaluated_candle_time TEXT
+            )
+        """)
+        cur.execute(
+            "INSERT INTO signals (signal_id, symbol, status) VALUES (?,?,?)",
+            ("sig-old", "BTCUSDT", "ACTIVE"))
+        conn.commit(); conn.close()
+        store = SignalStore(db_path=db_path)
+        state = store.get_outcome_state("sig-old")
+        assert state["status"] == "ACTIVE"
+        assert state["tp1_outcome_attempts"] == 0
+        assert state["tp2_outcome_attempts"] == 0
+        assert state["sl_outcome_attempts"] == 0
+
+    def test_notification_flags_not_reset(self, tmp_path):
+        """tp1_notified survives migration."""
+        db_path = str(tmp_path / "flags.db")
+        store = SignalStore(db_path=db_path)
+        sig = _make_signal()
+        _delivered(store, sig)
+        store.mark_outcome_notified(sig.signal_id, "TP1")
+        store2 = SignalStore(db_path=db_path)
+        assert store2.is_outcome_notified(sig.signal_id, "TP1")
+
+    def test_signals_still_monitored(self, tmp_path):
+        """Active signals remain in get_active_signals after re-open."""
+        db_path = str(tmp_path / "mon.db")
+        store = SignalStore(db_path=db_path)
+        sig = _make_signal()
+        _delivered(store, sig)
+        store2 = SignalStore(db_path=db_path)
+        ids = {s.signal_id for s in store2.get_active_signals(10)}
+        assert sig.signal_id in ids
+
+
+# ------------------------------------------------------------------
+# 11. Restart safety
+# ------------------------------------------------------------------
+class TestRestartSafety:
+    def test_state_preserved_after_restart(self, tmp_path):
+        """Pending notification survives process restart."""
+        db_path = str(tmp_path / "rs.db")
+        s1 = SignalStore(db_path=db_path)
+        sig = _make_signal()
+        _delivered(s1, sig)
+        now = BASE + timedelta(minutes=60)
+        c = _tp1_only_candle()
+        md = MagicMock(); md.fetch_klines.return_value = [c]
+        tb1 = MagicMock(); tb1.send_outcome = MagicMock(return_value=False)
+        runner1 = OutcomeMonitorRunner(s1, tb1, market_data=md, now_fn=lambda: now)
+        _run(runner1)
+        assert not s1.is_outcome_notified(sig.signal_id, "TP1")
+        s2 = SignalStore(db_path=db_path)
+        tb2 = MagicMock(); tb2.send_outcome = MagicMock(return_value=True)
+        runner2 = OutcomeMonitorRunner(s2, tb2, market_data=md, now_fn=lambda: now)
+        _run(runner2)
+        assert s2.is_outcome_notified(sig.signal_id, "TP1")
+
+
+# ------------------------------------------------------------------
+# 12. Duplicate protection
+# ------------------------------------------------------------------
+class TestDuplicateProtection:
+    def test_replay_no_duplicate_notifications(self, tmp_path):
+        """Restart does not double-send an already-notified level."""
+        db_path = str(tmp_path / "dup.db")
+        store = SignalStore(db_path=db_path)
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        md = MagicMock(); md.fetch_klines.return_value = [_tp1_only_candle()]
+        tb1 = MagicMock(); tb1.send_outcome = MagicMock(return_value=True)
+        OutcomeMonitorRunner(store, tb1, market_data=md,
+                             now_fn=lambda: now).run_once()
+        assert tb1.send_outcome.call_count == 1
+        tb2 = MagicMock(); tb2.send_outcome = MagicMock(return_value=True)
+        store2 = SignalStore(db_path=db_path)
+        OutcomeMonitorRunner(store2, tb2, market_data=md,
+                             now_fn=lambda: now).run_once()
+        assert tb2.send_outcome.call_count == 0
+
+    def test_pagination_no_duplicate_level_notifications(self, tmp_path):
+        """Multiple pages must not cause a level to fire twice."""
+        db_path = str(tmp_path / "pdup.db")
+        store = SignalStore(db_path=db_path)
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=60)
+        md = _paginating_market_data(_pageable_candles())
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        OutcomeMonitorRunner(store, tb, market_data=md,
+                             now_fn=lambda: now, chunk_limit=1).run_once()
+        levels = [c.args[1] for c in tb.send_outcome.call_args_list]
+        assert levels.count("TP1") == 1
+        assert levels.count("TP2") == 1
+
+
+# ------------------------------------------------------------------
+# 13. Same-candle ambiguity — SL wins
+# ------------------------------------------------------------------
+class TestSameCandleAmbiguity:
+    def test_sl_wins_on_same_candle(self, tmp_path):
+        """When SL and TP both touch on the same candle, SL wins."""
+        store = SignalStore(db_path=str(tmp_path / "amb.db"))
+        sig = _make_signal()
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=20)
+        amb = _mk_candle(BASE + timedelta(minutes=10), "97", "109", "100")
+        md = MagicMock(); md.fetch_klines.return_value = [amb]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        sent = [c.args[1] for c in tb.send_outcome.call_args_list]
+        assert sent[0] == "SL"
+        assert store.get_outcome_state(sig.signal_id)["status"] == "STOPPED"
+
+    def test_short_sl_wins_on_same_candle(self, tmp_path):
+        """SHORT: SL wins even when TP is also touched."""
+        store = SignalStore(db_path=str(tmp_path / "amb2.db"))
+        sig = _make_signal(SignalDirection.SHORT, symbol="ETHUSDT")
+        _delivered(store, sig)
+        now = BASE + timedelta(minutes=20)
+        amb = _mk_candle(BASE + timedelta(minutes=10), "93", "105", "100")
+        md = MagicMock(); md.fetch_klines.return_value = [amb]
+        tb = MagicMock(); tb.send_outcome = MagicMock(return_value=True)
+        runner = OutcomeMonitorRunner(store, tb, market_data=md,
+                                      now_fn=lambda: now)
+        _run(runner)
+        sent = [c.args[1] for c in tb.send_outcome.call_args_list]
+        assert sent[0] == "SL"

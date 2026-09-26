@@ -61,9 +61,16 @@ class BinanceMarketData:
         symbol: str,
         interval: str,
         limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
     ) -> List[Candle]:
         """
         Fetch OHLCV klines from Binance (public, read-only).
+
+        ``start_time`` / ``end_time`` are optional timezone-aware bounds used
+        by the outcome monitor to page through historical candles. When
+        ``start_time`` is given, Binance returns the FIRST ``limit`` candles
+        at or after that instant, which makes forward pagination possible.
 
         Retry policy:
         - transient 5xx / network errors: exponential backoff up to max_retries
@@ -78,7 +85,13 @@ class BinanceMarketData:
             raise MarketDataError("limit must be between 1 and 1000")
 
         endpoint = f"{self.base_url}/api/v3/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        params: Dict[str, Any] = {
+            "symbol": symbol, "interval": interval, "limit": limit,
+        }
+        if start_time is not None:
+            params["startTime"] = int(start_time.timestamp() * 1000)
+        if end_time is not None:
+            params["endTime"] = int(end_time.timestamp() * 1000)
 
         last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):

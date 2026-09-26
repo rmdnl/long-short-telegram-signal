@@ -48,6 +48,14 @@ _OUTCOME_NOTIFY_COLUMNS = {
     OUTCOME_SL: "sl_notified",
 }
 
+#: Maps an outcome level to its INDEPENDENT retry-attempt counter. Each level
+#: is bounded by its own budget, so an exhausted TP1 never starves TP2/SL.
+_OUTCOME_ATTEMPT_COLUMNS = {
+    OUTCOME_TP1: "tp1_outcome_attempts",
+    OUTCOME_TP2: "tp2_outcome_attempts",
+    OUTCOME_SL: "sl_outcome_attempts",
+}
+
 #: Shared SELECT column list for full Signal reconstruction.
 _SIGNAL_COLUMNS = (
     "SELECT signal_id, symbol, direction, signal_type, created_at,"
@@ -132,7 +140,10 @@ class SignalStore:
                 sl_notified INTEGER NOT NULL DEFAULT 0,
                 outcome_attempts INTEGER NOT NULL DEFAULT 0,
                 last_outcome_error TEXT,
-                last_evaluated_candle_time TEXT
+                last_evaluated_candle_time TEXT,
+                tp1_outcome_attempts INTEGER NOT NULL DEFAULT 0,
+                tp2_outcome_attempts INTEGER NOT NULL DEFAULT 0,
+                sl_outcome_attempts INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -153,6 +164,13 @@ class SignalStore:
             cursor, "outcome_attempts", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(cursor, "last_outcome_error", "TEXT")
         self._ensure_column(cursor, "last_evaluated_candle_time", "TEXT")
+        # Per-level outcome retry accounting (PATCH 2).
+        self._ensure_column(
+            cursor, "tp1_outcome_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(
+            cursor, "tp2_outcome_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(
+            cursor, "sl_outcome_attempts", "INTEGER NOT NULL DEFAULT 0")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_meta (
@@ -444,14 +462,16 @@ class SignalStore:
         """Return the outcome bookkeeping row for a signal.
 
         Keys: status, tp1_hit_time, tp2_hit_time, sl_hit_time,
-        tp1_notified, tp2_notified, sl_notified, outcome_attempts.
+        tp1_notified, tp2_notified, sl_notified, outcome_attempts,
+        tp1_outcome_attempts, tp2_outcome_attempts, sl_outcome_attempts.
         Missing rows return a zeroed default so callers never crash.
         """
         conn = self._connect()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT status, tp1_hit_time, tp2_hit_time, sl_hit_time,"
-            " tp1_notified, tp2_notified, sl_notified, outcome_attempts"
+            " tp1_notified, tp2_notified, sl_notified, outcome_attempts,"
+            " tp1_outcome_attempts, tp2_outcome_attempts, sl_outcome_attempts"
             " FROM signals WHERE signal_id = ?",
             (signal_id,),
         )
@@ -463,6 +483,9 @@ class SignalStore:
                 "tp1_hit_time": None, "tp2_hit_time": None, "sl_hit_time": None,
                 "tp1_notified": 0, "tp2_notified": 0, "sl_notified": 0,
                 "outcome_attempts": 0,
+                "tp1_outcome_attempts": 0,
+                "tp2_outcome_attempts": 0,
+                "sl_outcome_attempts": 0,
             }
         return {
             "status": row[0],
@@ -473,6 +496,9 @@ class SignalStore:
             "tp2_notified": int(row[5] or 0),
             "sl_notified": int(row[6] or 0),
             "outcome_attempts": int(row[7] or 0),
+            "tp1_outcome_attempts": int(row[8] or 0),
+            "tp2_outcome_attempts": int(row[9] or 0),
+            "sl_outcome_attempts": int(row[10] or 0),
         }
 
     def record_outcome(
@@ -554,34 +580,77 @@ class SignalStore:
         conn.close()
         return bool(row) and int(row[0] or 0) == 1
 
-    def record_outcome_failure(self, signal_id: str, error: str = "") -> int:
+    def record_outcome_failure(self, signal_id: str,
+                               level: str = "", error: str = "") -> int:
         """Record a failed outcome notification and return the attempt count.
+
+        When *level* is one of TP1/TP2/SL the per-level counter is bumped
+        and returned, so each outcome retries independently. The legacy
+        global ``outcome_attempts`` is also bumped for backward
+        compatibility with older rows/tests. A call without a level
+        (legacy signature) only bumps the global counter.
 
         Bounded by OUTCOME_MAX_ATTEMPTS in the monitor so a permanently
         broken chat can never produce an infinite notification loop.
         """
+        # Backward-compat: old callers used record_outcome_failure(id, error)
+        # with the error as the second positional arg.
+        if level not in _OUTCOME_ATTEMPT_COLUMNS:
+            if error == "" and level:
+                error = level
+                level = ""
+            elif level and level not in _OUTCOME_ATTEMPT_COLUMNS:
+                # Unknown level string — treat as global-only failure.
+                error = error or level
+                level = ""
+
         conn = self._connect()
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE signals SET outcome_attempts = outcome_attempts + 1,"
-            " last_outcome_error = ? WHERE signal_id = ?",
-            (error[:500], signal_id),
-        )
-        cursor.execute(
-            "SELECT outcome_attempts FROM signals WHERE signal_id = ?",
-            (signal_id,))
+        if level in _OUTCOME_ATTEMPT_COLUMNS:
+            col = _OUTCOME_ATTEMPT_COLUMNS[level]
+            cursor.execute(
+                f"UPDATE signals SET {col} = {col} + 1,"
+                " outcome_attempts = outcome_attempts + 1,"
+                " last_outcome_error = ? WHERE signal_id = ?",
+                (error[:500], signal_id),
+            )
+            cursor.execute(
+                f"SELECT {col} FROM signals WHERE signal_id = ?", (signal_id,))
+        else:
+            cursor.execute(
+                "UPDATE signals SET outcome_attempts = outcome_attempts + 1,"
+                " last_outcome_error = ? WHERE signal_id = ?",
+                (error[:500], signal_id),
+            )
+            cursor.execute(
+                "SELECT outcome_attempts FROM signals WHERE signal_id = ?",
+                (signal_id,))
         row = cursor.fetchone()
         conn.commit()
         conn.close()
-        attempts = row[0] if row else 0
-        logger.warning(
-            f"OUTCOME_NOTIFICATION_FAILED {signal_id} "
-            f"attempts={attempts} error={error}")
+        attempts = int(row[0]) if row and row[0] is not None else 0
+        if level:
+            logger.warning(
+                f"OUTCOME_NOTIFICATION_FAILED {signal_id} level={level} "
+                f"attempts={attempts} error={error}")
+        else:
+            logger.warning(
+                f"OUTCOME_NOTIFICATION_FAILED {signal_id} "
+                f"attempts={attempts} error={error}")
         return attempts
 
-    def get_outcome_attempts(self, signal_id: str) -> int:
-        """Number of recorded outcome-notification attempts for a signal."""
-        return int(self.get_outcome_state(signal_id).get("outcome_attempts") or 0)
+    def get_outcome_attempts(self, signal_id: str,
+                             level: Optional[str] = None) -> int:
+        """Number of recorded outcome-notification attempts for a signal.
+
+        When *level* is TP1/TP2/SL, returns that level's independent
+        counter; otherwise returns the legacy global counter.
+        """
+        state = self.get_outcome_state(signal_id)
+        if level in _OUTCOME_ATTEMPT_COLUMNS:
+            col = _OUTCOME_ATTEMPT_COLUMNS[level]
+            return int(state.get(col) or 0)
+        return int(state.get("outcome_attempts") or 0)
 
     def get_last_evaluated_candle_time(self, signal_id: str) -> Optional[datetime]:
         """Replay cursor: the most recent candle the outcome monitor
