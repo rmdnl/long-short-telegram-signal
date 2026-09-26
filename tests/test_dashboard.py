@@ -153,12 +153,20 @@ def test_get_root(monkeypatch, tmp_path):
     _, client, _, _ = _pingable_testapp(tmp_path, monkeypatch)
     r = client.get("/")
     assert r.status_code == 200
-    # Dashboard V2/V3 shell. Tracks the current intentional title/branding
-    # (brand "SIGNAL//ROOM", hero "Signal Room"). Update these together with
-    # dashboard/templates/index.html if the shell copy is redesigned.
+    # Dashboard V3 shell. Tracks the current intentional title/branding
+    # (brand "SIGNAL//ROOM", title "Long / Short Market Monitor"). Update
+    # these together with dashboard/templates/index.html if redesigned.
     assert "Long / Short Signal Monitor" in r.text
+    assert "Long / Short Market Monitor" in r.text
     assert "SIGNAL//ROOM" in r.text
-    assert "Signal Room" in r.text
+    assert "Market Overview" in r.text
+    assert "Live Signal Activity" in r.text
+    assert "System Status" in r.text
+    assert "Recent Signals" in r.text
+    assert "markets-subtitle" in r.text
+    assert "strip-system" in r.text
+    assert "markets-grid" in r.text
+    assert "signals-body" in r.text
     assert "/static/style.css" in r.text
     assert "/static/app.js" in r.text
 

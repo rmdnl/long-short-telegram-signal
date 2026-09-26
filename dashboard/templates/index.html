@@ -3,139 +3,171 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#090b0f">
+  <meta name="theme-color" content="#111417">
+  <meta name="description" content="Signal Room — Long / Short Market Monitor. Real-time market scanning and signal monitoring.">
   <title>Long / Short Signal Monitor</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="noise"></div>
+  <a class="skip-link" href="#markets">Skip to markets</a>
 
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark"><span>↗</span></div>
-      <div>
+      <div class="brand-mark" aria-hidden="true"><span></span></div>
+      <div class="brand-text">
         <div class="brand-name">SIGNAL//ROOM</div>
-        <div class="brand-sub">LONG / SHORT MONITOR</div>
+        <div class="brand-sub">Long / Short Market Monitor</div>
       </div>
     </div>
-    <div class="top-actions">
-      <span id="clock" class="clock">--:--:--</span>
-      <span id="connection-dot" class="connection-dot"></span>
-      <span id="connection-label">LIVE</span>
+    <div class="topbar-right">
+      <p class="topbar-tagline">Real-time market scanning and signal monitoring</p>
+      <div class="topbar-status">
+        <span class="sys-pill" id="header-system"><i class="dot"></i><span id="header-system-label">SYSTEM ONLINE</span></span>
+        <span class="tg-pill" id="header-telegram"><i class="dot"></i><span id="header-telegram-label">TELEGRAM ON</span></span>
+      </div>
     </div>
   </header>
 
   <main class="shell">
-    <section class="hero">
-      <div>
-        <div class="eyebrow">MARKET SIGNAL TERMINAL</div>
-        <h1>Signal Room</h1>
-        <p>Multi-timeframe crypto scanner · signal only · no order execution</p>
+    <!-- 2. SYSTEM STATUS STRIP -->
+    <section class="strip" aria-label="System status">
+      <div class="strip-item">
+        <span class="strip-label">System</span>
+        <strong class="strip-value" id="strip-system">--</strong>
+        <span class="strip-sub" id="strip-system-sub">waiting for data</span>
       </div>
-      <div class="hero-badges">
-        <span class="pill pill-live"><i></i> <span id="hero-status">ONLINE</span></span>
-        <span class="pill">5M TRIGGER</span>
-        <span class="pill">MIN SCORE <b id="min-score">75</b></span>
+      <div class="strip-item">
+        <span class="strip-label">Scan</span>
+        <strong class="strip-value" id="strip-scan">#--</strong>
+        <span class="strip-sub" id="strip-scan-sub">cycle</span>
+      </div>
+      <div class="strip-item">
+        <span class="strip-label">Last scan</span>
+        <strong class="strip-value" id="strip-last">--</strong>
+        <span class="strip-sub" id="strip-last-sub">--</span>
+      </div>
+      <div class="strip-item">
+        <span class="strip-label">Next scan</span>
+        <strong class="strip-value" id="strip-next">--</strong>
+        <span class="strip-sub" id="strip-next-sub">--</span>
+      </div>
+      <div class="strip-item">
+        <span class="strip-label">Markets</span>
+        <strong class="strip-value" id="strip-markets">--</strong>
+        <span class="strip-sub" id="strip-markets-sub">monitored</span>
+      </div>
+      <div class="strip-item">
+        <span class="strip-label">Signals</span>
+        <strong class="strip-value" id="strip-signals">--</strong>
+        <span class="strip-sub" id="strip-signals-sub">total recorded</span>
       </div>
     </section>
 
-    <section class="metrics-grid">
-      <article class="metric metric-status">
-        <div class="metric-label">BOT STATUS</div>
-        <div class="metric-value"><span class="status-dot"></span><span id="bot-status">ONLINE</span></div>
-        <div class="metric-meta" id="bot-cycle">CYCLE --</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">UPTIME</div>
-        <div class="metric-value" id="uptime">--</div>
-        <div class="metric-meta">runtime</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">LAST SCAN</div>
-        <div class="metric-value" id="last-scan">--</div>
-        <div class="metric-meta" id="last-scan-meta">waiting</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">NEXT SCAN</div>
-        <div class="metric-value" id="next-scan">--</div>
-        <div class="metric-meta">~60 sec cadence</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">TELEGRAM</div>
-        <div class="metric-value" id="telegram">--</div>
-        <div class="metric-meta">delivery</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">DATABASE</div>
-        <div class="metric-value" id="database">--</div>
-        <div class="metric-meta">read-only monitor</div>
-      </article>
-    </section>
-
-    <section class="dashboard-grid">
-      <div class="panel panel-wide">
-        <div class="panel-head">
-          <div>
-            <span class="panel-kicker">LIVE TAPE</span>
-            <h2>Symbol Matrix</h2>
-          </div>
-          <span class="panel-count" id="symbol-count">0 / 0</span>
-        </div>
-        <div class="matrix-wrap">
-          <div id="symbol-grid" class="symbol-grid"></div>
-        </div>
-      </div>
-
-      <aside class="side-stack">
-        <div class="panel compact-panel">
-          <div class="panel-head">
-            <div>
-              <span class="panel-kicker">TELEGRAM</span>
-              <h2>Delivery</h2>
-            </div>
-          </div>
-          <div class="delivery-row"><span>Delivered</span><strong id="delivered">0</strong></div>
-          <div class="delivery-row"><span>Failed</span><strong id="failed">0</strong></div>
-          <div class="delivery-bar"><span id="delivery-bar"></span></div>
-        </div>
-
-        <div class="panel compact-panel">
-          <div class="panel-head">
-            <div>
-              <span class="panel-kicker">OUTCOMES</span>
-              <h2>Tracker</h2>
-            </div>
-          </div>
-          <div class="outcome-grid">
-            <div><b id="tp1">0</b><span>TP1</span></div>
-            <div><b id="tp2">0</b><span>TP2</span></div>
-            <div><b id="stopped">0</b><span>SL</span></div>
-            <div><b id="expired">0</b><span>EXP</span></div>
-          </div>
-        </div>
-      </aside>
-    </section>
-
-    <section class="panel feed-panel">
+    <!-- 3. MARKET OVERVIEW -->
+    <section class="panel markets-panel" id="markets" aria-label="Market overview">
       <div class="panel-head">
         <div>
-          <span class="panel-kicker">EVENT STREAM</span>
-          <h2>Latest Signals</h2>
+          <h2>Market Overview</h2>
+          <p class="panel-sub" id="markets-subtitle">Waiting for configuration</p>
         </div>
-        <span class="live-tag"><i></i> AUTO REFRESH</span>
-      </div>
-      <div id="signal-feed" class="signal-feed">
-        <div class="empty-state">
-          <div class="empty-icon">⌁</div>
-          <strong>No signals yet</strong>
-          <span>The scanner is running. Waiting for a setup to qualify.</span>
+        <div class="panel-head-right">
+          <span class="scanner-chip" id="scanner-chip"><i class="dot"></i><span id="scanner-chip-label">Scanner active</span></span>
+          <span class="panel-meta" id="markets-meta">--</span>
         </div>
       </div>
+      <div class="markets-grid" id="markets-grid" role="list"></div>
     </section>
 
-    <section class="footer-strip">
-      <span>EMA 50/200</span><span>ADX 14</span><span>RSI 14</span><span>ATR 14</span><span>VOL SMA 20</span>
-      <span class="footer-right">SIGNAL ONLY · NO AUTO TRADING</span>
+    <!-- 4 + 5. LIVE ACTIVITY + SYSTEM STATUS -->
+    <div class="duo">
+      <section class="panel" aria-label="Live signal activity">
+        <div class="panel-head">
+          <div>
+            <h2>Live Signal Activity</h2>
+            <p class="panel-sub" id="activity-sub">Latest qualified setups</p>
+          </div>
+          <span class="live-tag"><i class="dot"></i>Auto refresh</span>
+        </div>
+        <div class="activity-body" id="activity-body"></div>
+      </section>
+
+      <aside class="panel" aria-label="System status">
+        <div class="panel-head">
+          <div>
+            <h2>System Status</h2>
+            <p class="panel-sub">Operational state</p>
+          </div>
+        </div>
+        <dl class="status-list">
+          <div class="status-row">
+            <dt>Scanner</dt>
+            <dd id="sys-scanner"><i class="dot"></i><span>--</span></dd>
+          </div>
+          <div class="status-row">
+            <dt>Database</dt>
+            <dd id="sys-database"><i class="dot"></i><span>--</span></dd>
+          </div>
+          <div class="status-row">
+            <dt>Telegram</dt>
+            <dd id="sys-telegram"><i class="dot"></i><span>--</span></dd>
+          </div>
+          <div class="status-row">
+            <dt>Signal mode</dt>
+            <dd id="sys-mode"><i class="dot"></i><span>--</span></dd>
+          </div>
+          <div class="status-row">
+            <dt>Min score</dt>
+            <dd id="sys-minscore"><span>--</span></dd>
+          </div>
+          <div class="status-row">
+            <dt>Uptime</dt>
+            <dd id="sys-uptime"><span>--</span></dd>
+          </div>
+          <div class="status-row">
+            <dt>Total signals</dt>
+            <dd id="sys-signals"><span>--</span></dd>
+          </div>
+          <div class="status-row">
+            <dt>Active / expired</dt>
+            <dd id="sys-signals-sub"><span>--</span></dd>
+          </div>
+        </dl>
+        <div class="sys-note" id="sys-note">Waiting for first status poll.</div>
+      </aside>
+    </div>
+
+    <!-- 6. RECENT SIGNALS -->
+    <section class="panel" aria-label="Recent signals">
+      <div class="panel-head">
+        <div>
+          <h2>Recent Signals</h2>
+          <p class="panel-sub" id="recent-sub">Newest first</p>
+        </div>
+        <span class="panel-meta" id="recent-count">--</span>
+      </div>
+      <div class="table-wrap">
+        <table class="signals-table" id="signals-table">
+          <thead>
+            <tr>
+              <th scope="col">Time</th>
+              <th scope="col">Symbol</th>
+              <th scope="col">Side</th>
+              <th scope="col">Entry</th>
+              <th scope="col">SL</th>
+              <th scope="col">TP1</th>
+              <th scope="col">TP2</th>
+              <th scope="col">Score</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody id="signals-body"></tbody>
+        </table>
+        <div class="table-empty" id="signals-empty" hidden>
+          <strong>No signals recorded yet</strong>
+          <span>The scanner is running. New qualified setups will appear here.</span>
+        </div>
+      </div>
+      <p class="foot-note">Signal only — no automatic trading. Read-only monitor.</p>
     </section>
   </main>
 
