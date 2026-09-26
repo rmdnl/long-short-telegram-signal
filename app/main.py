@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 from app.config import get_config, Config, ConfigValidationError
 from app.logger import setup_logger, get_logger
@@ -25,6 +26,12 @@ from app.scanner import Scanner
 from app.signal_store import SignalStore, DELIVERY_PENDING
 from app.telegram_bot import TelegramBot
 from app.trading_guard import assert_no_execution_code, ExecutionCodeFound
+from app.outcome_monitor import (
+    evaluate_signal_outcome,
+    OutcomeMonitorRunner,
+    OUTCOME_MAX_ATTEMPTS,
+)
+from app.market_data import BinanceMarketData
 
 setup_logger()
 logger = get_logger(__name__)
@@ -34,6 +41,93 @@ logger = get_logger(__name__)
 # DELIVERED, non-retried) so it does not spam Telegram indefinitely if
 # the target chat or bot is permanently broken.
 DELIVERY_MAX_ATTEMPTS = 3
+
+# ------------------------------------------------------------------
+# Startup-notification crash-loop protection
+# ------------------------------------------------------------------
+# A systemd / Docker restart loop would otherwise send "BOT ONLINE" every few
+# seconds and flood the chat. We persist the last startup-notification time
+# in SQLite and suppress the message when the previous successful start was
+# less than STARTUP_NOTICE_MIN_INTERVAL_SECONDS ago.
+STARTUP_NOTICE_MIN_INTERVAL_SECONDS = 300
+_STARTUP_NOTICE_META_KEY = "last_startup_notice_at"
+
+# Epoch seconds of the first-ever boot. Used to report uptime even when the
+# process that started us is a fresh restart.
+_BOT_BOOTED_AT_META_KEY = "bot_booted_at_epoch"
+
+
+def _parse_epoch(raw: Optional[str]) -> Optional[float]:
+    """Parse a persisted epoch-seconds string, returning None when unusable."""
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _send_startup_notification(config, store: SignalStore,
+                               telegram_bot: Optional[TelegramBot],
+                               send_telegram: bool) -> None:
+    """Send exactly one 🚀 BOT ONLINE message per session, rate-limited.
+
+    Rate limiting is persisted (not in-memory) so a crash-restart loop cannot
+    bypass it: the timestamp of the last *successful* startup notice lives in
+    SQLite, and a restart inside the cooldown window is logged but silent.
+    """
+    now = datetime.now(timezone.utc)
+
+    # First boot ever: record the boot epoch so uptime is reportable.
+    if store.get_meta(_BOT_BOOTED_AT_META_KEY) is None:
+        store.set_meta(_BOT_BOOTED_AT_META_KEY, str(now.timestamp()))
+
+    booted_at = _parse_epoch(store.get_meta(_BOT_BOOTED_AT_META_KEY)) or now.timestamp()
+    uptime_seconds = max(0, int(now.timestamp() - booted_at))
+
+    # Crash-loop guard.
+    last_notice = _parse_epoch(store.get_meta(_STARTUP_NOTICE_META_KEY))
+    if last_notice is not None:
+        elapsed = (now.timestamp() - last_notice)
+        if elapsed < STARTUP_NOTICE_MIN_INTERVAL_SECONDS:
+            logger.warning(
+                f"Startup notification SUPPRESSED: last sent {elapsed:.0f}s ago "
+                f"(< {STARTUP_NOTICE_MIN_INTERVAL_SECONDS}s cooldown). "
+                f"Possible crash-restart loop."
+            )
+            return
+
+    # Component health snapshot.
+    components = {
+        "Scanner": True,
+        "Signal store": True,
+        "Telegram": bool(send_telegram),
+        "Outcome monitor": True,
+    }
+
+    if not send_telegram or telegram_bot is None:
+        logger.info(
+            "Telegram disabled: startup notification not sent (dry-run/no delivery)"
+        )
+        return
+
+    try:
+        ok = telegram_bot.send_startup(
+            symbols=config.symbols,
+            interval_seconds=config.scan_interval_seconds,
+            min_score=config.min_score,
+            components=components,
+        )
+    except Exception as e:
+        # A notification must never take the process down.
+        logger.error(f"Startup notification raised, ignoring: {e}", exc_info=True)
+        return
+
+    if ok:
+        store.set_meta(_STARTUP_NOTICE_META_KEY, str(now.timestamp()))
+        logger.info("BOT ONLINE notification delivered")
+    else:
+        logger.warning("BOT ONLINE notification failed (not retried until next boot)")
 
 
 def _apply_dry_run(force: bool) -> None:
@@ -130,6 +224,27 @@ def main() -> None:
     if send_telegram:
         _retry_pending_deliveries(store, telegram_bot)
 
+    # ------------------------------------------------------------------
+    # Startup notification: one 🚀 BOT ONLINE message after successful init.
+    # ------------------------------------------------------------------
+    _send_startup_notification(config, store, telegram_bot, send_telegram)
+
+    # ------------------------------------------------------------------
+    # Outcome monitor: evaluates active signals against closed market data to
+    # detect TP1 / TP2 / SL hits. Created only when Telegram is live, because
+    # an undelivered signal is never monitorable and we must not pay for
+    # market data we cannot act on.
+    # ------------------------------------------------------------------
+    outcome_monitor = None
+    if send_telegram:
+        try:
+            outcome_monitor = OutcomeMonitorRunner(store, telegram_bot)
+            logger.info("Outcome monitor initialized")
+        except Exception as e:
+            logger.error(
+                f"Failed to initialize outcome monitor: {e}", exc_info=True)
+            outcome_monitor = None
+
     cycle_count = 0
     try:
         while True:
@@ -159,6 +274,18 @@ def main() -> None:
                 except Exception as e:
                     logger.error(
                         f"Delivery error for {signal.signal_id}: {e}",
+                        exc_info=True,
+                    )
+
+            # Outcome monitor: one pass per cycle, isolated from the scanner.
+            if outcome_monitor is not None:
+                try:
+                    outcome_monitor.run_once()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"Outcome monitor failure (cycle {cycle_count}): {e}",
                         exc_info=True,
                     )
 

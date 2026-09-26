@@ -20,7 +20,7 @@ duplicate suppression survive a process restart.
 import sqlite3
 from pathlib import Path
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.models import (
@@ -35,6 +35,26 @@ logger = get_logger(__name__)
 DELIVERY_PENDING = "PENDING"
 DELIVERY_DELIVERED = "DELIVERED"
 DELIVERY_FAILED = "FAILED"
+
+# Outcome levels that can each be notified exactly once.
+OUTCOME_TP1 = "TP1"
+OUTCOME_TP2 = "TP2"
+OUTCOME_SL = "SL"
+
+#: Maps an outcome level to its persisted "already notified" column.
+_OUTCOME_NOTIFY_COLUMNS = {
+    OUTCOME_TP1: "tp1_notified",
+    OUTCOME_TP2: "tp2_notified",
+    OUTCOME_SL: "sl_notified",
+}
+
+#: Shared SELECT column list for full Signal reconstruction.
+_SIGNAL_COLUMNS = (
+    "SELECT signal_id, symbol, direction, signal_type, created_at,"
+    " trigger_candle_time, entry_low, entry_high, stop_loss, tp1, tp2,"
+    " score, htf_bias, adx_value, rsi_value, volume_ratio, status,"
+    " tp1_hit_time, tp2_hit_time, sl_hit_time, expiration_time"
+)
 
 
 def _to_aware_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -51,6 +71,12 @@ def _to_aware_datetime(value: Optional[str]) -> Optional[datetime]:
         from datetime import timezone
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _iso(dt: datetime) -> str:
+    """Serialize a datetime as an ISO string sqlite3 can bind without
+    the deprecated datetime adapter (avoids the 3.12 warning)."""
+    return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
 
 
 def _to_optional_decimal(value) -> Optional[Decimal]:
@@ -100,7 +126,13 @@ class SignalStore:
                 expiration_time TEXT,
                 delivery_status TEXT NOT NULL DEFAULT 'PENDING',
                 delivery_attempts INTEGER NOT NULL DEFAULT 0,
-                last_delivery_error TEXT
+                last_delivery_error TEXT,
+                tp1_notified INTEGER NOT NULL DEFAULT 0,
+                tp2_notified INTEGER NOT NULL DEFAULT 0,
+                sl_notified INTEGER NOT NULL DEFAULT 0,
+                outcome_attempts INTEGER NOT NULL DEFAULT 0,
+                last_outcome_error TEXT,
+                last_evaluated_candle_time TEXT
             )
         """)
 
@@ -110,6 +142,24 @@ class SignalStore:
         self._ensure_column(
             cursor, "delivery_attempts", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column(cursor, "last_delivery_error", "TEXT")
+        # Outcome-monitor migration (TP/SL notification state).
+        self._ensure_column(
+            cursor, "tp1_notified", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(
+            cursor, "tp2_notified", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(
+            cursor, "sl_notified", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(
+            cursor, "outcome_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(cursor, "last_outcome_error", "TEXT")
+        self._ensure_column(cursor, "last_evaluated_candle_time", "TEXT")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
 
         conn.commit()
         conn.close()
@@ -230,11 +280,7 @@ class SignalStore:
         cursor = conn.cursor()
 
         cursor.execute(
-            "SELECT signal_id, symbol, direction, signal_type, created_at,"
-            " trigger_candle_time, entry_low, entry_high, stop_loss, tp1, tp2,"
-            " score, htf_bias, adx_value, rsi_value, volume_ratio, status,"
-            " tp1_hit_time, tp2_hit_time, sl_hit_time, expiration_time"
-            " FROM signals WHERE signal_id = ?",
+            _SIGNAL_COLUMNS + " FROM signals WHERE signal_id = ?",
             (signal_id,),
         )
         row = cursor.fetchone()
@@ -296,10 +342,7 @@ class SignalStore:
         conn = self._connect()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT signal_id, symbol, direction, signal_type, created_at,"
-            " trigger_candle_time, entry_low, entry_high, stop_loss, tp1, tp2,"
-            " score, htf_bias, adx_value, rsi_value, volume_ratio, status,"
-            " tp1_hit_time, tp2_hit_time, sl_hit_time, expiration_time"
+            _SIGNAL_COLUMNS +
             " FROM signals WHERE delivery_status != ?"
             " ORDER BY created_at ASC LIMIT ?",
             (DELIVERY_DELIVERED, limit),
@@ -369,3 +412,222 @@ class SignalStore:
 
         conn.close()
         return [row[0] for row in rows]
+
+    # ------------------------------------------------------------------
+    # Outcome state (TP1 / TP2 / SL monitor)
+    # ------------------------------------------------------------------
+    def get_active_signals(self, limit: int = 50) -> List[Signal]:
+        """Return signals still being monitored, oldest trigger first.
+
+        A signal stays monitorable while its lifecycle status is ACTIVE or
+        TP1_HIT (TP1_HIT still needs a TP2/SL verdict). Terminal states
+        (TP2_HIT / STOPPED / INVALIDATED / EXPIRED) are excluded.
+
+        Only DELIVERED signals are monitorable: the user must have actually
+        seen the signal before being told it hit TP or SL.
+        """
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            _SIGNAL_COLUMNS +
+            " FROM signals WHERE status IN (?, ?)"
+            " AND delivery_status = ?"
+            " ORDER BY trigger_candle_time ASC LIMIT ?",
+            (SignalStatus.ACTIVE.value, SignalStatus.TP1_HIT.value,
+             DELIVERY_DELIVERED, limit),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._row_to_signal(r) for r in rows]
+
+    def get_outcome_state(self, signal_id: str) -> dict:
+        """Return the outcome bookkeeping row for a signal.
+
+        Keys: status, tp1_hit_time, tp2_hit_time, sl_hit_time,
+        tp1_notified, tp2_notified, sl_notified, outcome_attempts.
+        Missing rows return a zeroed default so callers never crash.
+        """
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, tp1_hit_time, tp2_hit_time, sl_hit_time,"
+            " tp1_notified, tp2_notified, sl_notified, outcome_attempts"
+            " FROM signals WHERE signal_id = ?",
+            (signal_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return {
+                "status": SignalStatus.ACTIVE.value,
+                "tp1_hit_time": None, "tp2_hit_time": None, "sl_hit_time": None,
+                "tp1_notified": 0, "tp2_notified": 0, "sl_notified": 0,
+                "outcome_attempts": 0,
+            }
+        return {
+            "status": row[0],
+            "tp1_hit_time": row[1],
+            "tp2_hit_time": row[2],
+            "sl_hit_time": row[3],
+            "tp1_notified": int(row[4] or 0),
+            "tp2_notified": int(row[5] or 0),
+            "sl_notified": int(row[6] or 0),
+            "outcome_attempts": int(row[7] or 0),
+        }
+
+    def record_outcome(
+        self,
+        signal_id: str,
+        status: str,
+        tp1_hit_time: Optional[object] = None,
+        tp2_hit_time: Optional[object] = None,
+        sl_hit_time: Optional[object] = None,
+    ) -> None:
+        """Persist an outcome state transition (monotonic, idempotent).
+
+        Only NULL columns are filled: a previously recorded hit time is never
+        overwritten, so replaying the same evaluation is harmless. The
+        terminal-state guard mirrors the state machine — once the signal is
+        TP2_HIT / STOPPED / INVALIDATED / EXPIRED it can never move back to a
+        non-terminal status.
+
+        ``*_hit_time`` may be a string or a datetime — datetimes are
+        serialized via :func:`_iso` so the sqlite3 datetime-adapter warning
+        (Python 3.12) never fires.
+        """
+        def _maybe_iso(value):
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return _iso(value)
+            return str(value)
+
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE signals SET"
+            " status = CASE WHEN status IN"
+            "   ('TP2_HIT', 'STOPPED', 'INVALIDATED', 'EXPIRED')"
+            "   THEN status ELSE ? END,"
+            " tp1_hit_time = COALESCE(tp1_hit_time, ?),"
+            " tp2_hit_time = COALESCE(tp2_hit_time, ?),"
+            " sl_hit_time = COALESCE(sl_hit_time, ?)"
+            " WHERE signal_id = ?",
+            (status, _maybe_iso(tp1_hit_time), _maybe_iso(tp2_hit_time),
+             _maybe_iso(sl_hit_time), signal_id),
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"OUTCOME_UPDATED {signal_id} status={status}")
+
+    def mark_outcome_notified(self, signal_id: str, level: str) -> None:
+        """Flip the per-level notification flag so a level is sent exactly once.
+
+        The UPDATE is guarded by `= 0` so a concurrent/restarted process
+        cannot send the same level twice.
+        """
+        if level not in _OUTCOME_NOTIFY_COLUMNS:
+            raise ValueError(f"Unknown outcome level: {level}")
+        column = _OUTCOME_NOTIFY_COLUMNS[level]
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE signals SET {column} = 1 WHERE signal_id = ? AND {column} = 0",
+            (signal_id,),
+        )
+        changed = cursor.rowcount
+        conn.commit()
+        conn.close()
+        if changed == 0:
+            logger.debug(f"Outcome notification {level} already sent for {signal_id}")
+
+    def is_outcome_notified(self, signal_id: str, level: str) -> bool:
+        """True when the given level's notification already went out."""
+        if level not in _OUTCOME_NOTIFY_COLUMNS:
+            raise ValueError(f"Unknown outcome level: {level}")
+        column = _OUTCOME_NOTIFY_COLUMNS[level]
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {column} FROM signals WHERE signal_id = ?", (signal_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return bool(row) and int(row[0] or 0) == 1
+
+    def record_outcome_failure(self, signal_id: str, error: str = "") -> int:
+        """Record a failed outcome notification and return the attempt count.
+
+        Bounded by OUTCOME_MAX_ATTEMPTS in the monitor so a permanently
+        broken chat can never produce an infinite notification loop.
+        """
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE signals SET outcome_attempts = outcome_attempts + 1,"
+            " last_outcome_error = ? WHERE signal_id = ?",
+            (error[:500], signal_id),
+        )
+        cursor.execute(
+            "SELECT outcome_attempts FROM signals WHERE signal_id = ?",
+            (signal_id,))
+        row = cursor.fetchone()
+        conn.commit()
+        conn.close()
+        attempts = row[0] if row else 0
+        logger.warning(
+            f"OUTCOME_NOTIFICATION_FAILED {signal_id} "
+            f"attempts={attempts} error={error}")
+        return attempts
+
+    def get_outcome_attempts(self, signal_id: str) -> int:
+        """Number of recorded outcome-notification attempts for a signal."""
+        return int(self.get_outcome_state(signal_id).get("outcome_attempts") or 0)
+
+    def get_last_evaluated_candle_time(self, signal_id: str) -> Optional[datetime]:
+        """Replay cursor: the most recent candle the outcome monitor
+        has evaluated for this signal. None when never evaluated."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT last_evaluated_candle_time FROM signals WHERE signal_id = ?",
+            (signal_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row or row[0] is None:
+            return None
+        return _to_aware_datetime(row[0])
+
+    def set_last_evaluated_candle_time(self, signal_id: str, ts: datetime) -> None:
+        """Advance the replay cursor so a restarted monitor never
+        re-evaluates a closed candle."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE signals SET last_evaluated_candle_time = ? WHERE signal_id = ?",
+            (_iso(ts), signal_id),
+        )
+        conn.commit()
+        conn.close()
+
+    # ------------------------------------------------------------------
+    # Key/value metadata (crash-loop protection, uptime bookkeeping)
+    # ------------------------------------------------------------------
+    def get_meta(self, key: str) -> Optional[str]:
+        """Read a persisted metadata value, or None when absent."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM bot_meta WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Write a persisted metadata value (upsert)."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO bot_meta (key, value) VALUES (?, ?)",
+            (key, value))
+        conn.commit()
+        conn.close()

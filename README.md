@@ -55,9 +55,32 @@ The parts that used to be *documented-but-not-wired* are now actually in the pro
             │
             ▼
    telegram_bot.py         HTTP POST (requests) → your chat
+            │
+            ▼
+   outcome_monitor.py      TP1 / TP2 / SL evaluation on closed candles
 ```
 
 Everything is deterministic given the same candles. No wall-clock in signal decisions, no network in the backtest.
+
+### Outcome Monitor (new)
+
+`outcome_monitor.py` evaluates every active, delivered signal against the
+latest **closed** 5M candles. When a candle touches TP1, TP2, or SL, a
+notification is sent — exactly once per level, persisted in SQLite so a
+restart never re-notifies.
+
+State machine (monotonic, never backward):
+
+```text
+ACTIVE → TP1_HIT → TP2_HIT (terminal)
+            → STOPPED   (terminal, SL before or after TP1)
+ACTIVE → STOPPED        (terminal, SL before TP1)
+ANY   → EXPIRED        (terminal, TTL, silent)
+```
+
+Same-candle ambiguity policy (deterministic, conservative):
+If a single candle touches both a TP level and SL, **SL wins** — we never
+know the intra-candle order, so we assume the worst case.
 
 ---
 
@@ -209,6 +232,40 @@ Retry handling inside `telegram_bot.py`:
 
 The token is read from the environment and is never logged or hard-coded.
 
+### 🚀 Startup notification (new)
+
+After successful initialization the bot sends exactly one `🚀 BOT ONLINE`
+message containing the symbols, scan interval, min score, Telegram state, and
+per-component health.
+
+**Crash-loop protection.** A systemd/Docker restart loop would otherwise spam
+the chat with `BOT ONLINE` every few seconds. The timestamp of the last
+*successful* startup notice is persisted in SQLite (`bot_meta.last_startup_notice_at`),
+and a restart inside a **300s** cooldown window is logged but silent:
+
+```text
+Startup notification SUPPRESSED: last sent 42s ago (< 300s cooldown).
+Possible crash-restart loop.
+```
+
+Cooldown state lives in the database, not memory — a crash-restart loop cannot
+bypass it.
+
+### 🎯 TP1 / TP2 / SL notifications (new)
+
+The outcome monitor runs once per scan cycle, isolated from the scanner, and
+sends a message on each state change: `✅ TP1 HIT`, `🎯 TP2 HIT`, `🛑 SL HIT`.
+
+| Guard | Behaviour |
+| ----- | --------- |
+| Closed candles only | forming candles are never evaluated (no lookahead) |
+| `DELIVERED` only | an undelivered signal is never monitored (user never saw it) |
+| Exactly once | per-level `tp1_notified` / `tp2_notified` / `sl_notified` flags |
+| Replay cursor | `last_evaluated_candle_time` survives restart, no re-evaluation |
+| Terminal guard | `TP2_HIT` / `STOPPED` / `EXPIRED` can never move backward |
+| Bounded retry | `OUTCOME_MAX_ATTEMPTS = 3` per signal, no infinite loop |
+| Isolation | monitor failure never aborts the scan (and vice versa) |
+
 ---
 
 ## 💾 Persistence & Restart Safety
@@ -273,7 +330,7 @@ pytest -q
 ```
 
 ```text
-384 passed
+415 passed
 ```
 
 Coverage:
@@ -364,6 +421,9 @@ Application logs propagate to `journalctl`, to the log file, and to stdout. Hand
 | Max Data Age               |  30 sec  |
 | Scan Interval              |   60 sec  |
 | Delivery Max Attempts      |      3   |
+| Outcome Max Attempts       |      3   |
+| Startup Notice Cooldown    |    300 s |
+| Signal Max Age (TTL)       |     48 h |
 
 Default symbols: `BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT, DOGEUSDT, ADAUSDT, AVAXUSDT, LINKUSDT`
 
@@ -385,12 +445,13 @@ app/
   data_validation.py closed-candle cutoff + MTF sync
   signal_store.py   SQLite persistence + delivery state
   telegram_bot.py   HTTP delivery with bounded retry
+  outcome_monitor.py TP1/TP2/SL evaluation + notification runner
   trading_guard.py  boot-time execution-pattern guard
   config.py         env-driven config with validation
   logger.py         handler-safe logging setup
   models.py         Candle / Signal / enums
 backtest/           closed-only walk-forward harness
-tests/              384 tests
+tests/              415 tests
 ```
 
 ---

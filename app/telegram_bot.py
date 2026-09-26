@@ -13,7 +13,7 @@ PHASE 9 responsibilities:
 - Signal-only: never performs trading execution.
 """
 import time
-from typing import Optional
+from typing import List, Optional
 
 import requests
 
@@ -296,6 +296,85 @@ Invalidation:
 
 Signal only • No auto trading"""
         return message
+
+
+# ------------------------------------------------------------------
+    # Public API: startup & outcome notifications
+    # ------------------------------------------------------------------
+    def send_startup(
+        self,
+        symbols: List[str],
+        interval_seconds: int,
+        min_score: int,
+        components: dict,
+    ) -> bool:
+        """Send the single 🚀 BOT ONLINE message after successful init.
+
+        Returns True on success (or dry-run), False on failure after bounded
+        retries. Uses the same retry policy as send_signal().
+        """
+        from app.outcome_monitor import format_startup_notification
+
+        message = format_startup_notification(
+            symbols=symbols,
+            interval_seconds=interval_seconds,
+            min_score=min_score,
+            telegram_enabled=self.config.telegram_enabled,
+            components=components,
+        )
+
+        if not self.config.telegram_enabled:
+            logger.info(
+                f"[TELEGRAM DISABLED] Would send startup:\n--- message start ---\n"
+                f"{message}\n--- message end ---"
+            )
+            return True
+
+        try:
+            token, chat_id = self._resolve_credentials()
+        except TelegramConfigError as e:
+            logger.error(f"Telegram config error, not sending startup: {e}")
+            return False
+
+        try:
+            self._send_with_retry(token, chat_id, message)
+        except TelegramBotError as e:
+            logger.error(f"Telegram startup notification failed: {e}")
+            return False
+
+        logger.info("Startup notification sent")
+        return True
+
+    def send_outcome(self, signal: Signal, level: str) -> bool:
+        """Send a TP1 / TP2 / SL notification for an already-delivered signal.
+
+        level must be one of "TP1", "TP2", "SL".
+        """
+        from app.outcome_monitor import format_outcome
+
+        message = format_outcome(signal, level)
+
+        if not self.config.telegram_enabled:
+            logger.info(
+                f"[TELEGRAM DISABLED] Would send outcome {level} "
+                f"for {signal.signal_id}"
+            )
+            return True
+
+        try:
+            token, chat_id = self._resolve_credentials()
+        except TelegramConfigError as e:
+            logger.error(f"Telegram config error, not sending outcome: {e}")
+            return False
+
+        try:
+            self._send_with_retry(token, chat_id, message)
+        except TelegramBotError as e:
+            logger.error(f"Telegram outcome notification failed: {e}")
+            return False
+
+        logger.info(f"Outcome notification {level} sent for {signal.signal_id}")
+        return True
 
 
 # Module-level convenience used by main.py / scanner wiring
