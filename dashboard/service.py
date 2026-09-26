@@ -5,7 +5,7 @@ Pure data transformation over the read-only database and bot
 configuration. Never mutates trading state, signals, or Telegram.
 """
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dashboard.db import ReadOnlyDatabase
@@ -14,6 +14,14 @@ from dashboard.config import DashboardSettings, BotConfigSnapshot
 NA = None
 
 STALE_THRESHOLD_DEFAULT = 300
+
+# Runtime heartbeat keys written ONLY by the bot (app/main.py) into the
+# existing bot_meta table. The dashboard only reads them.
+RUNTIME_KEY_BOT_STARTED_AT = "bot_started_at"
+RUNTIME_KEY_LAST_SCAN_STARTED_AT = "last_scan_started_at"
+RUNTIME_KEY_LAST_SCAN_COMPLETED_AT = "last_scan_completed_at"
+RUNTIME_KEY_LAST_HEARTBEAT = "last_heartbeat"
+RUNTIME_KEY_SCAN_CYCLE = "scan_cycle"
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -53,15 +61,65 @@ def _iso(dt) -> Optional[str]:
 
 
 def _age_seconds(ts_iso: Optional[str]) -> Optional[float]:
-    if not ts_iso:
+    dt = _parse_ts(ts_iso)
+    if dt is None:
         return None
     try:
-        dt = datetime.fromisoformat(ts_iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - dt).total_seconds()
     except Exception:
         return None
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    """Parse an ISO string or epoch-seconds string into aware UTC datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # Legacy epoch-seconds format (e.g. bot_booted_at_epoch).
+    try:
+        epoch = float(text)
+        # Epoch format is bare digits (optionally with a dot). Guard against
+        # ISO years like "2025-..." which also float()-fail, so a successful
+        # float parse here means epoch — but only if no date separators.
+        if all(c.isdigit() or c in "+-." for c in text):
+            return datetime.fromtimestamp(epoch, tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_cycle(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_stale_threshold(
+    settings_stale_after: Optional[int],
+    scan_interval: Optional[int],
+) -> int:
+    """Use the configured dashboard threshold; fall back to 3x scan interval."""
+    if settings_stale_after and settings_stale_after > 0:
+        return int(settings_stale_after)
+    if scan_interval and scan_interval > 0:
+        return int(scan_interval) * 3
+    return STALE_THRESHOLD_DEFAULT
 
 
 def _truncate_error(msg: str, limit: int = 200) -> str:
@@ -332,14 +390,77 @@ def build_score_distribution(
     ]
 
 
-def build_bot_activity(
+def _bot_activity_from_meta(
+    meta: dict,
+    now: datetime,
+    settings: DashboardSettings,
+    bot_config: BotConfigSnapshot,
+) -> dict:
+    """Derive ONLINE/STALE, uptime, last scan, cycle, next expected."""
+    bot_started_at = meta.get(RUNTIME_KEY_BOT_STARTED_AT)
+    last_scan_completed_at = meta.get(RUNTIME_KEY_LAST_SCAN_COMPLETED_AT)
+    last_heartbeat = meta.get(RUNTIME_KEY_LAST_HEARTBEAT)
+    scan_cycle = _safe_cycle(meta.get(RUNTIME_KEY_SCAN_CYCLE))
+
+    # Uptime from bot_started_at.
+    uptime_seconds = None
+    if bot_started_at:
+        dt = _parse_ts(bot_started_at)
+        if dt:
+            uptime_seconds = int((now - dt).total_seconds())
+
+    # Latest activity: prefer completed scan, then heartbeat.
+    latest_activity_time = None
+    latest_activity_age = None
+    if last_scan_completed_at:
+        dt = _parse_ts(last_scan_completed_at)
+        if dt:
+            latest_activity_time = dt.isoformat()
+            latest_activity_age = (now - dt).total_seconds()
+    if latest_activity_age is None and last_heartbeat:
+        dt = _parse_ts(last_heartbeat)
+        if dt:
+            latest_activity_time = dt.isoformat()
+            latest_activity_age = (now - dt).total_seconds()
+
+    # Next expected scan = last_scan_completed_at + interval.
+    next_expected = None
+    if last_scan_completed_at:
+        dt = _parse_ts(last_scan_completed_at)
+        if dt:
+            interval = bot_config.scan_interval_seconds
+            if interval and interval > 0:
+                next_dt = dt + timedelta(seconds=interval)
+                next_expected = next_dt.isoformat()
+
+    stale_threshold = _resolve_stale_threshold(
+        settings.stale_after_seconds,
+        bot_config.scan_interval_seconds,
+    )
+    stale = latest_activity_age is not None and latest_activity_age > stale_threshold
+
+    return {
+        "status_label": "STALE" if stale else "ONLINE",
+        "latest_activity_time": latest_activity_time,
+        "latest_activity_age_seconds": round(latest_activity_age, 1) if latest_activity_age is not None else None,
+        "stale": stale,
+        "stale_threshold_seconds": stale_threshold,
+        "uptime_seconds": uptime_seconds,
+        "scan_cycle": scan_cycle,
+        "next_expected": next_expected,
+    }
+
+
+def _legacy_bot_activity(
     latest_time: Optional[str],
     evaluated_time: Optional[str],
     boot_epoch: Optional[str],
     scan_interval: Optional[int],
 ) -> dict:
-    """Determine bot activity status from persisted evidence."""
+    """Preserve existing fallback when runtime meta is absent."""
     timestamps = []
+    latest_age = None
+    latest_time_val = None
     if latest_time:
         age = _age_seconds(latest_time)
         if age is not None:
@@ -348,43 +469,66 @@ def build_bot_activity(
         age = _age_seconds(evaluated_time)
         if age is not None:
             timestamps.append(("last_evaluated_candle", evaluated_time, age))
-
-    evidence = []
-    latest_age = None
     if timestamps:
         timestamps.sort(key=lambda t: t[2])
         latest_age = timestamps[0][2]
-        latest_time = timestamps[0][1]
-        evidence.append(f"{timestamps[0][0]} ({_age_human(latest_age)})")
-    if evaluated_time and latest_time != evaluated_time:
-        ev_age = _age_seconds(evaluated_time)
-        if ev_age is not None:
-            evidence.append(f"last_evaluated_candle ({_age_human(ev_age)})")
-
-    if boot_epoch:
-        try:
-            booted = datetime.fromisoformat(boot_epoch, )
-            if booted.tzinfo is None:
-                booted = booted.replace(tzinfo=timezone.utc)
-            uptime = int((datetime.now(timezone.utc) - booted).total_seconds())
-            evidence.append(f"bot_booted_at_epoch ({_age_human(uptime)})")
-        except Exception:
-            uptime = None
-    else:
-        uptime = None
+        latest_time_val = timestamps[0][1]
 
     stale_threshold = scan_interval and scan_interval * 3 or STALE_THRESHOLD_DEFAULT
     stale = latest_age is not None and latest_age > stale_threshold
 
+    uptime_seconds = None
+    if boot_epoch:
+        dt = _parse_ts(boot_epoch)
+        if dt:
+            uptime_seconds = int((datetime.now(timezone.utc) - dt).total_seconds())
+
     return {
         "status_label": "DATA ACTIVITY",
-        "evidence": evidence,
-        "latest_activity_time": latest_time,
+        "latest_activity_time": latest_time_val,
         "latest_activity_age_seconds": round(latest_age, 1) if latest_age is not None else None,
         "stale": stale,
         "stale_threshold_seconds": stale_threshold,
-        "uptime_seconds": uptime,
+        "uptime_seconds": uptime_seconds,
+        "scan_cycle": None,
+        "next_expected": None,
     }
+
+
+def build_bot_activity(
+    db: ReadOnlyDatabase,
+    settings: DashboardSettings,
+    bot_config: BotConfigSnapshot,
+) -> dict:
+    """Determine bot activity status from runtime heartbeat meta.
+
+    Uses bot_meta keys written by the running bot when present;
+    otherwise falls back to the legacy signal-based behaviour so
+    the dashboard degrades gracefully before the bot has written
+    any heartbeat.
+    """
+    now = datetime.now(timezone.utc)
+    meta = db.get_meta_all()
+
+    # Runtime meta present when any heartbeat key exists or a cycle
+    # number has been persisted.
+    has_runtime = any(
+        meta.get(k) not in (None, "")
+        for k in (
+            RUNTIME_KEY_BOT_STARTED_AT,
+            RUNTIME_KEY_LAST_SCAN_COMPLETED_AT,
+            RUNTIME_KEY_LAST_HEARTBEAT,
+            RUNTIME_KEY_SCAN_CYCLE,
+        )
+    )
+    if has_runtime:
+        return _bot_activity_from_meta(meta, now, settings, bot_config)
+    return _legacy_bot_activity(
+        db.latest_signal_time(),
+        db.last_evaluated_time(),
+        db.bot_uptime_epoch(),
+        bot_config.scan_interval_seconds,
+    )
 
 
 def _age_human(seconds: float) -> str:
@@ -426,7 +570,20 @@ def build_dashboard_context(
             "reliability": {},
             "distribution": [],
             "activity": [],
-            "bot_activity": build_bot_activity(None, None, None, None),
+            "bot_activity": {
+                "status_label": "DATA ACTIVITY",
+                "evidence": ["database unavailable"],
+                "latest_activity_time": None,
+                "latest_activity_age_seconds": None,
+                "stale": False,
+                "stale_threshold_seconds": _resolve_stale_threshold(
+                    settings.stale_after_seconds,
+                    bot_config.scan_interval_seconds,
+                ),
+                "uptime_seconds": None,
+                "scan_cycle": None,
+                "next_expected": None,
+            },
         })
         return ctx
 
@@ -456,12 +613,7 @@ def build_dashboard_context(
         db.fetch_signals(limit=settings.activity_limit),
         max_items=settings.activity_limit,
     )
-    bot_activity = build_bot_activity(
-        db.latest_signal_time(),
-        db.last_evaluated_time(),
-        db.bot_uptime_epoch(),
-        bot_config.scan_interval_seconds,
-    )
+    bot_activity = build_bot_activity(db, settings, bot_config)
 
     ctx.update({
         "summary": build_statistics(total, by_direction, by_status, delivery_counts),

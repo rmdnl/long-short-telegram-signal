@@ -56,6 +56,38 @@ _STARTUP_NOTICE_META_KEY = "last_startup_notice_at"
 # process that started us is a fresh restart.
 _BOT_BOOTED_AT_META_KEY = "bot_booted_at_epoch"
 
+# ------------------------------------------------------------------
+# Runtime heartbeat keys (bot -> bot_meta -> dashboard, read-only)
+# ------------------------------------------------------------------
+# The dashboard reads these to derive ONLINE/STALE, uptime, last scan
+# and next-expected-scan. Only the bot writes them; failures are logged
+# and never allowed to interrupt signal scanning.
+META_KEY_BOT_STARTED_AT = "bot_started_at"
+META_KEY_LAST_SCAN_STARTED_AT = "last_scan_started_at"
+META_KEY_LAST_SCAN_COMPLETED_AT = "last_scan_completed_at"
+META_KEY_LAST_HEARTBEAT = "last_heartbeat"
+META_KEY_SCAN_CYCLE = "scan_cycle"
+
+
+def _utc_iso() -> str:
+    """Timezone-aware UTC timestamp string (ISO-8601), project convention."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _set_meta_safe(store: SignalStore, key: str, value: str) -> bool:
+    """Persist a runtime metadata value without ever raising.
+
+    Heartbeat persistence is best-effort: a failure is logged and ignored so
+    the trading-signal loop keeps running. Unexpected scanner exceptions are
+    NOT swallowed here — only meta writes are guarded.
+    """
+    try:
+        store.set_meta(key, value)
+        return True
+    except Exception as e:
+        logger.error(f"Heartbeat meta write failed ({key}): {e}", exc_info=True)
+        return False
+
 
 def _parse_epoch(raw: Optional[str]) -> Optional[float]:
     """Parse a persisted epoch-seconds string, returning None when unusable."""
@@ -207,6 +239,13 @@ def main() -> None:
     store = SignalStore()
 
     # ------------------------------------------------------------------
+    # Runtime heartbeat: record process start time so the dashboard can
+    # derive uptime. Written once per process; a restart resets the
+    # baseline. Best-effort: failure never blocks startup.
+    # ------------------------------------------------------------------
+    _set_meta_safe(store, META_KEY_BOT_STARTED_AT, _utc_iso())
+
+    # ------------------------------------------------------------------
     # Restart safety: rehydrate the cooldown / opposite-direction gate from
     # SQLite so a process restart cannot be used to bypass the cooldown
     # window for any symbol.
@@ -252,6 +291,11 @@ def main() -> None:
             logger.info(f"--- Scan cycle {cycle_count} ---")
             cycle_start = datetime.now(timezone.utc)
 
+            # Heartbeat: scan started (best-effort, never blocks scanning).
+            _set_meta_safe(store, META_KEY_LAST_SCAN_STARTED_AT, cycle_start.isoformat())
+            _set_meta_safe(store, META_KEY_LAST_HEARTBEAT, cycle_start.isoformat())
+            _set_meta_safe(store, META_KEY_SCAN_CYCLE, str(cycle_count))
+
             try:
                 signals = scanner.scan_all_symbols()
             except KeyboardInterrupt:
@@ -262,6 +306,13 @@ def main() -> None:
                 signals = []
 
             logger.info(f"Scan completed. Found {len(signals)} candidate signal(s)")
+
+            # Heartbeat: scan completed (proves the cycle actually finished).
+            # Updated even when zero signals — NO_SIGNAL is valid activity.
+            _completed_at = datetime.now(timezone.utc).isoformat()
+            _set_meta_safe(store, META_KEY_LAST_SCAN_COMPLETED_AT, _completed_at)
+            _set_meta_safe(store, META_KEY_LAST_HEARTBEAT, _completed_at)
+            _set_meta_safe(store, META_KEY_SCAN_CYCLE, str(cycle_count))
 
             for signal in signals:
                 try:

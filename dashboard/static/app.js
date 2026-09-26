@@ -36,6 +36,17 @@ function fmtTime(iso) {
   } catch (e) { return escapeHtml(iso); }
 }
 
+// Wall-clock time only, e.g. "05:43:09". Returns null when unavailable so
+// callers can render N/A rather than a fabricated value.
+function fmtClock(iso) {
+  if (!iso) return null;
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    return d.toLocaleTimeString();
+  } catch (e) { return null; }
+}
+
 function ageHuman(seconds) {
   if (seconds === null || seconds === undefined) return null;
   const s = Math.max(0, Math.floor(seconds));
@@ -117,33 +128,47 @@ function updateTimestamp() {
 function renderStatus(data) {
   const ba = data.bot_activity || {};
 
+  // BOT STATUS: ONLINE / STALE / DATA ACTIVITY (fallback when no runtime meta).
+  const label = ba.status_label || 'N/A';
   if (ba.status_label) {
-    const stale = ba.stale ? " 🟡 STALE" : "";
-    setText("badge-bot-status", "🟢 " + ba.status_label + stale);
+    const stale = ba.stale ? ' STALE' : '';
+    setText('badge-bot-status', label + stale);
+  }
+  setText('card-bot-status', label);
+
+  // UPTIME from bot_started_at. N/A when never reported.
+  const uptime = durationHuman(ba.uptime_seconds);
+  setText('card-uptime', uptime || 'N/A');
+
+  // LAST SCAN from last_scan_completed_at (falls back to last_heartbeat).
+  // Show the wall-clock time; keep the age in the tooltip.
+  const lastScan = fmtClock(ba.latest_activity_time);
+  setText('card-last-scan', lastScan || 'N/A');
+  const scanCard = $('card-last-scan');
+  const age = ageHuman(ba.latest_activity_age_seconds);
+  if (scanCard) {
+    if (age) scanCard.title = age;
+    else scanCard.removeAttribute('title');
   }
 
-  setText("card-bot-status", ba.status_label || "N/A");
+  // NEXT EXPECTED = last_scan_completed_at + scan_interval_seconds.
+  // Never fabricated: N/A when the bot has not reported a completed scan.
+  const nextScan = fmtClock(ba.next_expected);
+  setText('card-next-scan', nextScan || 'N/A');
 
-  const uptime = durationHuman(ba.uptime_seconds);
-  setText("card-uptime", uptime || "N/A");
-
-  const age = ageHuman(ba.latest_activity_age_seconds);
-  setText("card-last-scan", age || "N/A");
-
-  const interval = data.scan_interval_seconds;
-  if (age && interval) {
-    setText("card-next-scan", "~" + interval + "s cadence");
-  } else {
-    setText("card-next-scan", "N/A");
+  // Scan cycle, when the bot has reported one.
+  if (ba.scan_cycle !== null && ba.scan_cycle !== undefined) {
+    setText('badge-bot-status',
+      label + (ba.stale ? ' STALE' : '') + ' #' + ba.scan_cycle);
   }
 
   const tg = data.telegram_enabled;
-  setText("card-telegram", tg ? "ENABLED" : "DISABLED");
-  setText("badge-telegram-status", tg ? "ENABLED" : "DISABLED");
+  setText('card-telegram', tg ? 'ENABLED' : 'DISABLED');
+  setText('badge-telegram-status', tg ? 'ENABLED' : 'DISABLED');
 
-  setText("card-database", data.available ? "CONNECTED" : "UNAVAILABLE");
-  setText("card-total-signals", data.summary ? String(data.summary.total_signals) : "N/A");
-  setText("card-active-signals", data.summary ? String(data.summary.active) : "N/A");
+  setText('card-database', data.available ? 'CONNECTED' : 'UNAVAILABLE');
+  setText('card-total-signals', data.summary ? String(data.summary.total_signals) : 'N/A');
+  setText('card-active-signals', data.summary ? String(data.summary.active) : 'N/A');
 }
 
 function renderMatrix(rows) {
