@@ -165,11 +165,36 @@ class SignalEngine:
         )
         entry_mid = (entry_low + entry_high) / 2
 
+        # Structure-first stop loss.  The documented design prefers a
+        # swing-structure level (recent swing low for LONG, recent swing
+        # high for SHORT) computed from the closed 15M setup candles,
+        # falling back to ATR when structure is unavailable or invalid.
+        #
+        # Validity rules (protective side only):
+        #   LONG  -> swing_low  < entry_low  (SL sits below the entry)
+        #   SHORT -> swing_high > entry_high (SL sits above the entry)
+        # An invalid swing would either place the SL on the wrong side
+        # or produce a near-zero risk, so ATR fallback is used instead.
+        # All candles consumed here are already closed by cutoff, so
+        # no lookahead is introduced.
+        _swing_lookback = 10
+        if direction == SignalDirection.LONG:
+            candidate = risk_engine.find_swing_low(
+                setup_candles, lookback=_swing_lookback)
+            if candidate >= entry_low:
+                candidate = None
+        else:
+            candidate = risk_engine.find_swing_high(
+                setup_candles, lookback=_swing_lookback)
+            if candidate <= entry_high:
+                candidate = None
+
         stop_loss = risk_engine.calculate_stop_loss(
             direction,
             entry_mid,
             setup_ind.atr,
             self.config.sl_atr_multiplier,
+            swing_level=candidate,
         )
 
         tp1, tp2 = risk_engine.calculate_take_profit(

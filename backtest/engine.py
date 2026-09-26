@@ -97,9 +97,15 @@ class BacktestEngine:
         Both last_signal_time and the current trigger open time are on the same
         time base (candle open), so `cooldown_candles * interval` is the true
         number of trigger candles between two signals. Mirrors live mode.
+
+        check_cooldown returns True when the cooldown has fully elapsed
+        (allow) and False when the signal is still within cooldown (block).
         """
         st = self._state_for(symbol)
         interval = dv.TIMEFRAME_SECONDS[TRIGGER_TF]
+        # Pass trigger_open_time as `now`: this is the same time base as
+        # last_signal_time (candle open), so the elapsed time correctly
+        # represents how many candles have passed.
         return signal_filter.check_cooldown(
             st.last_signal_time, trigger_open_time, interval,
             self.config.cooldown_candles,

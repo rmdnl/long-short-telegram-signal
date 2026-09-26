@@ -1,9 +1,14 @@
 # 🚨 Long/Short Telegram Signal Bot
 
-> **Crypto signal bot yang tugasnya cuma satu: nyari setup, ngitung level, terus teriak ke Telegram.**
->
-> Bukan trader. Bukan cenayang. Bukan mesin ATM.
-> **Signal only. No auto trading.** 🫡
+> **This bot does not buy your bags.**
+> It just screams LONG or SHORT into Telegram and lets you decide whether you want to do something about it. 🫡
+
+```text
+Market:  "Bro,pls pump."
+Bot:     "Based on what."
+Market:  " vibes "
+Bot:     "NO SIGNAL." 🗿
+```
 
 [![Python](https://img.shields.io/badge/Python-3.12+-blue?logo=python)](https://www.python.org/)
 [![Binance](https://img.shields.io/badge/Data-Binance%20Public-yellow?logo=binance)](https://www.binance.com/)
@@ -11,310 +16,264 @@
 
 ---
 
-## 🧠 Jadi bot ini ngapain?
+## TL;DR
 
-Bot ini mantengin market Binance pakai **public market data**, lalu mencari setup LONG/SHORT berdasarkan kombinasi:
+Signal-only. It reads public Binance klines, runs a 1H → 15M → 5M checklist, and posts a fully-formatted setup to Telegram if the checklist passes. It never places an order, has no Binance private API key, and has a guard that physically refuses to boot if someone adds one.
 
-* 📈 EMA 50 / EMA 200
-* 💪 ADX 14 + +DI / -DI
-* 🧠 RSI 14
-* 🌋 ATR 14
-* 📊 Volume SMA 20
-* 🕐 Multi-timeframe 1H → 15M → 5M
-* 🎯 Entry zone
-* 🛑 Stop Loss
-* 💰 TP1 / TP2
-* 🧮 Quality score 0–100
-
-Kalau semua syarat lewat, bot kirim signal ke Telegram.
-
-Kalau nggak lewat?
-
-> **NO SIGNAL. Duduk manis. Jangan maksa market.** 🗿
-
-Bot **tidak memasang order**, tidak melakukan buy/sell, tidak menggunakan leverage, dan tidak membutuhkan Binance trading API key.
+The parts that used to be *documented-but-not-wired* are now actually in the production path — see [What changed](#-what-changed-honestly).
 
 ---
 
-# 🎯 Signal Logic
-
-## LONG
-
-### 1H bias
-
-* EMA 50 > EMA 200
-* Price berada di atas EMA 50
-
-### 15M setup
-
-* EMA 50 > EMA 200
-* ADX ≥ 22
-* +DI > -DI
-* RSI melakukan recovery melewati midline 50
-
-### 5M trigger
-
-* Candle bullish
-* Close menembus high candle sebelumnya
-* Volume memenuhi threshold
-
-### Filter tambahan
-
-* Price tidak terlalu jauh dari EMA 50
-* Risk/reward valid
-* Score memenuhi minimum
-
-Kalau semuanya lolos:
-
-> 🟢 **LONG**
-
----
-
-## SHORT
-
-Kebalikannya:
-
-### 1H bias
-
-* EMA 50 < EMA 200
-* Price berada di bawah EMA 50
-
-### 15M setup
-
-* EMA 50 < EMA 200
-* ADX ≥ 22
-* -DI > +DI
-* RSI turun melewati midline 50
-
-### 5M trigger
-
-* Candle bearish
-* Close menembus low candle sebelumnya
-* Volume memenuhi threshold
-
-Kalau semua lolos:
-
-> 🔴 **SHORT**
-
----
-
-# 🧮 Quality Score
-
-Score **bukan probabilitas kemenangan**.
-
-Jangan lihat:
-
-> Score 95 = 95% pasti cuan
-
-❌ Nope.
-
-Score adalah ukuran kualitas setup berdasarkan komponen yang terpenuhi.
-
-| Komponen     |   Bobot |
-| ------------ | ------: |
-| 1H HTF Bias  |      20 |
-| EMA Trend    |      15 |
-| ADX Strength |      15 |
-| DI Direction |      10 |
-| RSI Momentum |      15 |
-| 5M Trigger   |      10 |
-| Volume       |      10 |
-| Risk/Reward  |       5 |
-| **Total**    | **100** |
-
-Default:
-
-```env
-MIN_SCORE=80
-```
-
-Jadi bot bukan tipe:
-
-> “RSI nyentuh 49.9, GAS BROOO 🚀”
-
-Bot lebih ke:
-
-> “Tunggu. Checklist dulu.” ☕🗿
-
----
-
-# 🎯 Entry, SL & TP
-
-Risk engine menghitung level secara dinamis menggunakan ATR.
-
-Default:
+## 🧠 Architecture
 
 ```text
-ATR       = 14
-SL        = 1.5 × ATR
-TP1       = 1.5R
-TP2       = 2.5R
+ Binance public REST klines
+            │
+            ▼
+   market_data.py          fetch + parse (rate-limit aware)
+            │
+            ▼
+   data_validation.py      closed-candle cutoff, MTF sync, stale-data
+            │
+            ▼
+   indicators.py           EMA/ADX/DI/RSI/ATR/VolSMA via pandas
+            │
+            ▼
+   strategy.py             bias + setup + trigger predicates
+            │
+            ▼
+   signal_engine.py        orchestration, scoring, risk/reward
+            │
+            ├── risk_engine.py        entry zone, structure-first SL, TP
+            └── signal_filter.py      cooldown, dedup, staleness
+            │
+            ▼
+   scanner.py              per-symbol gate + isolation
+            │
+            ▼
+   signal_store.py         SQLite (source of truth)
+            │
+            ▼
+   telegram_bot.py         HTTP POST (requests) → your chat
 ```
 
-Contoh LONG:
+Everything is deterministic given the same candles. No wall-clock in signal decisions, no network in the backtest.
+
+---
+
+## 🔀 The 1H → 15M → 5M Flow
+
+| TF   | Role       | What it decides                                        |
+| ---- | ---------- | ------------------------------------------------------ |
+| 1H   | **Bias**   | Which direction is even allowed (LONG / SHORT / NEUTRAL) |
+| 15M  | **Setup**  | Whether a pullback is worth taking (trend, ADX, DI, RSI) |
+| 5M   | **Trigger**| The actual closed-candle confirmation + entry + volume  |
+
+**1H is the boss.** If 1H says NEUTRAL, the engine returns `None` immediately. No amount of 5M excitement overrides a flat higher-timeframe.
+
+**5M is the trigger reference.** Signals are only ever evaluated on a *closed* 5M candle. The forming candle is never read — see [No-lookahead](#-no-lookahead-i-mean-it).
+
+### LONG
+
+| Step | Condition                                                        |
+| ---- | ---------------------------------------------------------------- |
+| 1H   | EMA50 > EMA200, price above EMA50                                |
+| 15M  | EMA50 > EMA200, ADX ≥ 22, +DI > -DI, RSI crossing back over 50   |
+| 5M   | Bullish close breaking prior candle high, volume ≥ 1.2× SMA      |
+| Extra| Not overextended from EMA50, score ≥ 80, R:R valid                |
+
+### SHORT
+
+Exact mirror: EMA50 < EMA200, -DI > +DI, RSI crossing down through 50, bearish 5M close breaking the prior low.
+
+---
+
+## 📐 Indicators
+
+| Indicator | Length | Role                                  |
+| --------- | -----: | ------------------------------------- |
+| EMA       |     50 | Trend + overextension anchor           |
+| EMA       |    200 | Macro trend filter                     |
+| ADX       |     14 | Trend *strength* gate (≥ 22)           |
+| +DI/-DI   |     14 | Direction confirmation                 |
+| RSI       |     14 | Pullback exhaustion vs midline (50)    |
+| ATR       |     14 | Volatility-scaled risk geometry       |
+| Volume SMA|     20 | Participation confirmation (1.2×)     |
+
+That is the whole list. No MACD. No Bollinger. No Ichimoku. No "AI predicts 99.7%". The chart stays readable. 🧘
+
+---
+
+## 🧮 Scoring
+
+**Score is NOT a win probability.** It is a setup-quality measure. Please stop treating the number as a percentage. It isn't.
+
+| Component     | Weight |
+| ------------- | -----: |
+| 1H HTF bias   |     20 |
+| EMA trend     |     15 |
+| ADX strength  |     15 |
+| DI direction  |     10 |
+| RSI momentum  |     15 |
+| 5M trigger    |     10 |
+| Volume        |     10 |
+| Risk/reward   |      5 |
+| **Total**     | **100** |
+
+Default gate: `MIN_SCORE=80`. Signals below the gate are dropped and logged with a reason, not silently discarded.
+
+---
+
+## 🎯 Risk Management: Entry, SL, TP
+
+**Stop loss is structure-first, ATR-fallback.** This is the real order of operations in `risk_engine.calculate_stop_loss()` as wired in `signal_engine.generate_signal()`:
 
 ```text
-TP2  ─────────────────── 🚀
-TP1  ─────────────── 💰
+1. Structure
+     LONG  → recent 15M swing LOW   (must sit below the entry zone)
+     SHORT → recent 15M swing HIGH  (must sit above the entry zone)
 
-Entry ─────────────── 🎯
-
-SL   ──────────────── 🛑
+2. ATR fallback
+     LONG  → entry_mid − (ATR × 1.5)
+     SHORT → entry_mid + (ATR × 1.5)
 ```
 
-Untuk SHORT arahnya dibalik.
+A swing level is **rejected** (falling back to ATR) if it sits on the wrong side of the entry or would produce a near-zero risk. Structure must actually protect the trade to be used.
 
-### Catatan audit
-
-Risk engine memang memiliki fungsi untuk mencari swing high/swing low.
-
-Namun pada production signal path saat ini, `SignalEngine` tidak mengirim swing level tersebut ke `calculate_stop_loss()`.
-
-Jadi **SL production saat ini adalah ATR-based**, bukan automatic structure-first SL.
-
-README tidak akan pura-pura bilang fitur itu sudah aktif. 😎
-
----
-
-# 📡 Telegram
-
-Telegram hanya digunakan sebagai output signal.
-
-Contoh:
+All swing detection reads the **closed 15M setup candles only** — the same series the rest of the engine uses, already cut off by `data_validation`. No future candle is involved.
 
 ```text
-🚨 LONG
+LONG:
 
-BTCUSDT
-TIMEFRAME: 5M
-
-Entry:
-...
-
-SL:
-...
-
-TP1:
-...
-
-TP2:
-...
-
-RR:
-...
-
-Score:
-.../100
-
-Setup:
-...
-
-Confirmation:
-• 1H trend
-• 15M trend
-• ADX / DI
-• RSI
-• 5M trigger
-• Volume
-
-Invalidation:
-...
-
-Signal only • No auto trading
+TP2  ─────────────────── 🚀   entry_mid + 2.5R
+TP1  ─────────────── 💰      entry_mid + 1.5R
+Entry ─────────────── 🎯     entry_mid
+SL   ──────────────── 🛑     swing low, else entry_mid − 1.5×ATR
 ```
 
-Token Telegram berasal dari environment variable.
-
-Tidak di-hard-code di source.
+TP levels are derived *from* the stop, so the R:R ratios hold regardless of which SL path was taken.
 
 ---
 
-# 🔐 Security
+## 🛡️ Protections (all active in production)
 
-Bagian ini sengaja dibuat agak paranoid.
+### Closed-candle only
 
-Karena bot trading tanpa paranoid itu resep buat headline buruk. 😅
+`data_validation.cutoff_candles()` drops any candle whose close time is after the decision instant. Indicators, ATR, volume, DI — all computed on the post-cutoff series. A signal can never be triggered by a bar that is still forming.
 
-Bot:
+### Cooldown (`COOLDOWN_CANDLES=3`)
 
-* ❌ tidak membuat order
-* ❌ tidak buy
-* ❌ tidak sell
-* ❌ tidak menggunakan futures
-* ❌ tidak menggunakan margin
-* ❌ tidak menggunakan leverage
-* ❌ tidak melakukan withdrawal
-* ❌ tidak membutuhkan Binance private trading API key
-* ✅ menggunakan public market data
-* ✅ Telegram token dari environment
-* ✅ deterministic signal ID
-* ✅ SQLite persistence
-* ✅ trading-execution guard
-* ✅ bounded Telegram retry
-
-Trading-execution guard memindai source `app/` dan `backtest/` untuk pola execution tertentu.
-
-Kalau terdeteksi:
-
-> **Bot tidak boleh startup.** 🛑
-
-Intinya:
-
-> Kalau suatu hari ada yang iseng nyelipin fungsi order, bot diharapkan bilang **“NOPE.”**
-
----
-
-# 🛡️ Anti-noise
-
-Bot memiliki beberapa guard:
-
-* closed-candle validation
-* multi-timeframe synchronization
-* stale-data protection
-* duplicate signal ID
-* repeated 5M candle protection
-* overextension filter
-* volume confirmation
-* minimum score
-* minimum R:R
-* per-symbol isolation
-* bounded network retries
-* Telegram 429 handling
-
-Bot default scan setiap:
-
-```env
-SCAN_INTERVAL_SECONDS=60
-```
-
-Tapi signal dievaluasi berdasarkan **closed 5M candle**.
-
-Jadi bot boleh bangun tiap menit.
-
-Candle yang sama tidak boleh diproses berkali-kali.
-
-Kalau log muncul:
+A real production gate, evaluated per symbol before signal generation, using the **same helper** the backtest and the test suite use:
 
 ```text
-REPEATED_CANDLE
+allowed  ⟺  (now − last_signal_trigger_candle_open) ≥ 3 × 5m
 ```
 
-jangan panik.
+Measured in closed 5M trigger candles on a shared time base, so it is exact and restart-deterministic. `cooldown=0` disables it (never blocks forever).
 
-Bot bukan mati.
+### Opposite-signal protection
 
-Bot cuma bilang:
+While a symbol is inside its cooldown window, a signal in the *opposite* direction is blocked with a distinct reason code (`OPPOSITE_SIGNAL_BLOCKED` vs `COOLDOWN_ACTIVE`) so you can tell them apart in the logs. Outside the cooldown, a genuine bias flip is allowed — flipping direction is legitimate when the higher timeframe flips.
 
-> “Candle yang itu udah gue proses, bang.” 🗿
+### Duplicate suppression
+
+Signal IDs are deterministic:
+
+```text
+SYMBOL|TIMEFRAME|CANDLE_OPEN_TIME|DIRECTION
+```
+
+The same candle + direction can never produce a different ID, which is what makes dedup and restart-safety possible. Three layers: in-memory emitted-ID set → per-symbol processed-candle memory → SQLite.
+
+### Stale data, overextension, volume, min-score
+
+All live. All logged with a reason code rather than a shrug.
 
 ---
 
-# 🧪 Testing
+## 📡 Telegram
 
-Run:
+Output only, via direct HTTPS `POST` to the Bot API using `requests`. No `python-telegram-bot` — the whole integration is one endpoint and a formatted string, so the dependency was removed.
+
+Message contains direction, symbol, timeframe, entry zone, SL, TP1, TP2, R:R, score, confirmation checklist, and invalidation, ending with `Signal only • No auto trading`.
+
+Retry handling inside `telegram_bot.py`:
+
+| Condition        | Behaviour                                    |
+| ---------------- | -------------------------------------------- |
+| HTTP 200         | success                                      |
+| HTTP 429         | backoff + retry (bounded)                    |
+| HTTP 5xx / timeout | backoff + retry (bounded)                |
+| Other 4xx        | immediate failure (retrying is pointless)   |
+| `TELEGRAM_ENABLED=false` | no network call at all, logs instead |
+
+The token is read from the environment and is never logged or hard-coded.
+
+---
+
+## 💾 Persistence & Restart Safety
+
+SQLite is the source of truth. Two **independent** state axes are stored per signal:
+
+| Column              | Axis           | Values                                  |
+| ------------------- | -------------- | --------------------------------------- |
+| `status`            | Trade lifecycle| `ACTIVE`, `TP1_HIT`, `STOPPED`, ...     |
+| `delivery_status`   | Message delivery| `PENDING`, `DELIVERED`, `FAILED`       |
+
+They are deliberately separate. A signal can be a perfectly valid ACTIVE setup whose Telegram message has not arrived yet — collapsing the two would let a failed send masquerade as delivered.
+
+**The core fix:** duplicate suppression keys on `delivery_status == DELIVERED`, not on row existence.
+
+```text
+start → scan → signal → Telegram fail → process dies
+                                           ↓
+                                     next start
+                                           ↓
+                        undelivered signal is retried, NOT
+                        treated as processed ✅
+```
+
+- A failed send is recorded (`delivery_attempts += 1`) and stays non-`DELIVERED`.
+- On startup, `_retry_pending_deliveries()` retries every undelivered signal.
+- Retries are **bounded** by `DELIVERY_MAX_ATTEMPTS = 3` — no infinite retry, no spam.
+- In-memory scanner state is cleared for that symbol so the identical deterministic signal can be regenerated, but **only for that symbol** (other symbols' cooldown and dedup state are untouched).
+- A delivered signal is never sent again, across any number of restarts.
+
+`SignalStore.get_signal()` fully reconstructs a `Signal` from a row: LONG and SHORT, exact `Decimal` precision, timezone-aware timestamps preserved, deterministic ID unchanged.
+
+---
+
+## 🔐 Security Boundary
+
+Deliberately paranoid, because unhedged trading bots make bad headlines.
+
+| The bot does NOT            | The bot DOES                          |
+| -------------------------- | ------------------------------------- |
+| ❌ place orders             | ✅ read public market data            |
+| ❌ buy or sell              | ✅ take the token from the environment|
+| ❌ use futures              | ✅ generate deterministic IDs         |
+| ❌ use margin               | ✅ persist to SQLite                  |
+| ❌ use leverage             | ✅ run a boot-time execution guard     |
+| ❌ withdraw anything        | ✅ bound every retry                  |
+| ❌ need a Binance private API key | ✅ never touch a trading endpoint |
+
+`trading_guard.py` scans `app/` and `backtest/` for execution patterns at startup. If it trips, **the bot refuses to start** and exits non-zero.
+
+```text
+clean = true
+violations = 0
+```
+
+---
+
+## 🧪 Testing
 
 ```bash
 pytest -q
+```
+
+```text
+384 passed
 ```
 
 Coverage:
@@ -323,111 +282,41 @@ Coverage:
 pytest --cov=app --cov-report=term-missing
 ```
 
-Test suite mencakup area seperti:
-
-* signal engine
-* indicator logic
-* risk calculation
-* filters
-* no-lookahead
-* closed candle
-* score boundaries
-* deterministic signal ID
-* trading guard
-* Telegram delivery
-* logging
-* invalid-data paths
+Suites cover the signal engine, indicators, risk engine, filters, no-lookahead and closed-candle enforcement, score boundaries, deterministic IDs, the trading guard, Telegram delivery (including 429/5xx/timeout), logging propagation, SQLite round-trip, restart/dedup, and per-symbol isolation.
 
 ---
 
-# 🚀 Installation
-
-## 1. Clone
+## 🚀 Installation
 
 ```bash
 git clone https://github.com/rmdnl/long-short-telegram-signal.git
 cd long-short-telegram-signal
-```
-
-## 2. Python
-
-Recommended:
-
-```text
-Python 3.12+
-```
-
-Linux:
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-```
-
-Windows:
-
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\activate
-```
-
-## 3. Install dependency
-
-```bash
+python3.12 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-## 4. Environment
-
-Linux:
-
-```bash
 cp .env.example .env
 ```
-
-Windows:
-
-```powershell
-copy .env.example .env
-```
-
-Isi:
 
 ```env
 TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=your_real_token
 TELEGRAM_CHAT_ID=your_chat_id
-
 SIGNAL_ONLY=true
+DRY_RUN=false
 ```
 
 ---
 
-# 🧪 Dry Run
-
-Test engine tanpa mengirim Telegram:
+## 🧪 Dry Run
 
 ```bash
-python -m app.main --dry-run --cycles 1
-```
-
-Beberapa cycle:
-
-```bash
-python -m app.main --dry-run --cycles 10
-```
-
-Run terus:
-
-```bash
-python -m app.main
+python -m app.main --dry-run --cycles 1     # one cycle, no Telegram
+python -m app.main --dry-run --cycles 10    # ten cycles
+python -m app.main                          # run until Ctrl+C
 ```
 
 ---
 
-# 🖥️ VPS / systemd
-
-Contoh service:
+## 🖥️ VPS / systemd
 
 ```ini
 [Unit]
@@ -448,106 +337,71 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Enable:
-
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable long-short-signal
-sudo systemctl start long-short-signal
-```
-
-Monitor:
-
-```bash
+sudo systemctl enable --now long-short-signal
 sudo journalctl -u long-short-signal -f
 ```
 
+Application logs propagate to `journalctl`, to the log file, and to stdout. Handlers are installed once — repeated initialization does not duplicate output.
+
 ---
 
-# ⚙️ Default Parameters
+## ⚙️ Parameters
 
-| Parameter         |   Default |
-| ----------------- | --------: |
-| EMA Fast          |        50 |
-| EMA Slow          |       200 |
-| RSI               |        14 |
-| RSI Midline       |        50 |
-| ADX               |        14 |
-| ADX Minimum       |        22 |
-| ATR               |        14 |
-| SL ATR            |      1.5× |
-| TP1               |      1.5R |
-| TP2               |      2.5R |
-| Volume SMA        |        20 |
-| Volume Multiplier |      1.2× |
-| Minimum Score     |        80 |
-| Max EMA Distance  |     2 ATR |
-| Cooldown config   | 3 candles |
-| Scan Interval     |    60 sec |
+| Parameter                  |   Default |
+| -------------------------- | -------: |
+| EMA Fast / Slow            |  50 / 200 |
+| RSI / Midline              |  14 / 50  |
+| ADX / ADX Minimum          |  14 / 22  |
+| ATR                        |      14  |
+| SL ATR (fallback)          |     1.5× |
+| TP1 / TP2                  | 1.5R / 2.5R |
+| Volume SMA / Multiplier    |  20 / 1.2× |
+| Minimum Score              |      80  |
+| Max EMA Distance           |  2 ATR   |
+| Cooldown                   |  3 candles |
+| Max Data Age               |  30 sec  |
+| Scan Interval              |   60 sec  |
+| Delivery Max Attempts      |      3   |
 
-Default symbols:
+Default symbols: `BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT, DOGEUSDT, ADAUSDT, AVAXUSDT, LINKUSDT`
+
+---
+
+## 🗂️ Project Structure
 
 ```text
-BTCUSDT
-ETHUSDT
-BNBUSDT
-SOLUSDT
-XRPUSDT
-DOGEUSDT
-ADAUSDT
-AVAXUSDT
-LINKUSDT
+app/
+  main.py           entry point, delivery orchestration, bounded retry
+  scanner.py        per-symbol gate, isolation, reason codes
+  signal_engine.py  orchestration + scoring + structure-first SL
+  strategy.py       bias / setup / trigger predicates
+  indicators.py     pandas indicators
+  risk_engine.py    entry zone, swing detection, SL, TP
+  signal_filter.py  cooldown, dedup, staleness, closed-candle
+  market_data.py    Binance public klines
+  market_regime.py  regime classification
+  data_validation.py closed-candle cutoff + MTF sync
+  signal_store.py   SQLite persistence + delivery state
+  telegram_bot.py   HTTP delivery with bounded retry
+  trading_guard.py  boot-time execution-pattern guard
+  config.py         env-driven config with validation
+  logger.py         handler-safe logging setup
+  models.py         Candle / Signal / enums
+backtest/           closed-only walk-forward harness
+tests/              384 tests
 ```
 
 ---
 
-# 🗂️ Project Structure
+## 📊 Backtest Reality
 
-```text
-.
-├── app/
-│   ├── main.py
-│   ├── scanner.py
-│   ├── signal_engine.py
-│   ├── strategy.py
-│   ├── indicators.py
-│   ├── risk_engine.py
-│   ├── signal_filter.py
-│   ├── market_data.py
-│   ├── market_regime.py
-│   ├── signal_store.py
-│   ├── telegram_bot.py
-│   ├── trading_guard.py
-│   ├── config.py
-│   ├── logger.py
-│   └── models.py
-│
-├── backtest/
-├── tests/
-├── .env.example
-├── .gitignore
-└── requirements.txt
-```
+Being straight with you, because inflated numbers are how signal bots become urban legends.
 
----
+**Research/backtest results and live signal generation are different things.** The backtest harness is a research tool: it drives the live engine over historical closed-candle windows with no wall-clock and no network. Passing it is a *sanity check on the code*, not evidence of profitability.
 
-# 📊 Backtest Reality Check
-
-Project ini sudah melalui backtest multi-symbol dan multi-timeframe.
-
-Dan hasilnya tidak disembunyikan.
-
-Baseline historis menunjukkan strategi awal **belum profitable secara robust**.
-
-Eksperimen exit berbasis ATR trail memperbaiki beberapa statistik dibanding baseline, tetapi hasil out-of-sample tetap belum cukup untuk menyebut strategi ini sebagai sistem profit yang terbukti.
-
-Jadi:
-
-> **Backtest bukan surat cinta dari market.**
-
-Market bisa berubah.
-
-Karena itu status project adalah **candidate**, bukan:
+The honest state: the historical baseline is **not robustly profitable**, and out-of-sample results are not strong enough to call this a proven edge. It is a candidate, not:
 
 ```text
 100% PROFIT
@@ -555,118 +409,53 @@ GUARANTEED
 BUY MY COURSE
 ```
 
-😂
-
----
-
-# ⚠️ Known Limitations
-
-### 1. Structure-first SL belum aktif di production path
-
-Fungsi swing high/low tersedia di risk engine, tetapi `SignalEngine` saat ini menggunakan ATR-based SL.
-
-### 2. Cooldown function belum menjadi production gate utama
-
-`signal_filter.py` memiliki fungsi cooldown, tetapi scanner production menggunakan repeated-candle protection dan belum menjadikan fungsi cooldown tersebut sebagai gate utama signal generation.
-
-### 3. Opposite-signal helper belum menjadi production gate utama
-
-Helper untuk mendeteksi signal berlawanan tersedia, tetapi belum menjadi filter utama dalam production scan path.
-
-### 4. SignalStore reconstruction belum selesai
-
-`get_signal()` saat ini belum melakukan parsing penuh dari SQLite row kembali menjadi object `Signal`.
-
-### 5. Telegram delivery failure
-
-Jika Telegram gagal setelah bounded retry, signal tetap dapat disimpan secara lokal.
-
-Keuntungannya:
-
-* tidak spam retry
-* tidak membuat duplicate loop
-
-Konsekuensinya:
-
-* signal yang belum sampai Telegram dapat dianggap sudah diproses
-
-Ini layak diperbaiki jika reliability delivery menjadi prioritas utama.
-
-### 6. Telegram masih single chat ID
-
-Saat ini desainnya sederhana:
-
 ```text
-1 bot → 1 configured chat ID
+backtest / research results   ≠   live signal generation
 ```
 
-### 7. Tidak ada auto trading
-
-Dan ini **bukan bug**.
-
-Memang desainnya begitu. 😎
+A backtest win does not mean a live win. A backtest *loss* does not mean the signals are useless — it means the edge is unproven. Nobody knows which until the market weighs in. 🎲
 
 ---
 
-# 🧭 Philosophy
+## ⚠️ Known Limitations
 
-Project ini sengaja tidak memasukkan 47 indikator sampai chart kelihatan seperti dashboard pesawat.
+1. **No proven edge.** The strategy is not demonstrated profitable. Treat output as research, not a recommendation.
+2. **Backtest ≠ live.** Fill assumptions, latency, slippage, and fee dynamics are only partly modelled. Live results will differ.
+3. **Single chat ID.** `1 bot → 1 chat`. No multi-user support, no topics, no threads.
+4. **Cooldown is restored from SQLite on restart.** The cooldown gate runs in-memory per symbol, but `main()` calls `scanner.restore_cooldown_state()` at startup from `SignalStore.get_last_delivered_by_symbol()` so a restart cannot be used to bypass the cooldown window. The `delivery_status` axis is authoritative for "never send this twice"; cooldown timing is a separate liveness guard.
+5. **No live order management.** No position tracking, no partial fills, no trailing logic outside the backtest simulator. This is by design.
+6. **Public endpoints only.** Rate limits and exchange-side outages will show up as `MARKET_DATA_ERROR` or `RATE_LIMITED` rejections rather than trades.
+7. **No auto trading.** And this is not a bug. It is the point. 😎
 
-Tidak ada:
+---
 
-* MACD tambahan
-* Stochastic
-* CCI
-* Bollinger
-* Ichimoku
-* Supertrend
-* ML
-* sentiment magic
-* “AI predicts Bitcoin 99.7%”
+## 🧭 Philosophy
 
-Core:
+Fewer indicators, stricter gates, honest documentation.
 
 ```text
-Trend
-+
-Momentum
-+
-Strength
-+
-Volume
-+
-Trigger
-+
-Risk
-=
-Signal
+Trend + Momentum + Strength + Volume + Trigger + Risk = Signal
 ```
 
-Simple bukan berarti asal.
+A bot that says "no" 95% of the time and is right about 100% of those is worth more than one that says "yes" constantly.
 
 ---
 
-# 🤝 Contributing
+## 🤝 Contributing
 
-Kalau mau menambah fitur:
+1. Do not break the signal-only boundary.
+2. Do not add trading execution. Do not add a private API key.
+3. Do not use future candles. Ever.
+4. Add a regression test with every fix.
+5. Keep decisions deterministic where possible.
+6. Document any strategy change.
+7. Do not claim profitability without evidence.
 
-1. Jangan merusak signal-only boundary.
-2. Jangan memasukkan trading execution.
-3. Tambahkan test.
-4. Jangan menggunakan future candle.
-5. Jaga deterministic behavior kalau memungkinkan.
-6. Dokumentasikan perubahan strategy.
-7. Jangan mengklaim profitabilitas tanpa evidence.
-
-Kalau mau bikin auto-trading:
-
-> **Bikin repo lain.** 🧱
-
-Repo ini memang sengaja dipagari supaya signal tetap signal.
+If you want to build the auto-trading version: **use a different repo.** 🧱 This one is fenced on purpose.
 
 ---
 
-# ⚠️ Disclaimer
+## ⚠️ Disclaimer
 
 This software is for research, education, and informational purposes only.
 
@@ -678,25 +467,18 @@ The bot does not provide financial advice and does not execute trades.
 
 ---
 
-# 🗿 Final Boss Summary
+## 🗿 Final Boss Summary
 
 ```text
-Market:
-    "Gue mau naik."
-
-Bot:
-    "Bukti?"
-
-Market:
-    "..."
-
-Bot:
-    "NO SIGNAL."
+Market:  "I feel bullish."
+Bot:     "ADX?"
+Market:  "What's ADX."
+Bot:     "…"
+Market:  "..."
+Bot:     "NO SIGNAL."
 ```
 
-Dan honestly...
-
-**itu justru inti bot ini.** 😎📡
+And honestly? That restraint is the whole product. 📡
 
 ---
 

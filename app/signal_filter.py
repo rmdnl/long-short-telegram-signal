@@ -3,7 +3,7 @@ Signal filter module: anti false-signal guards.
 
 All filters are deterministic and stateless (or accept state explicitly).
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional, Set
 
@@ -41,14 +41,18 @@ def check_cooldown(
     """
     Cooldown check: no new signals within cooldown_candles of the last signal.
 
+    Deterministic: the decision depends only on candle boundary times
+    (no wall-clock drift), so it behaves identically across restarts.
+
     Args:
-        last_signal_time: Timestamp of last sent signal (None if never)
-        current_time: Current time (timezone-aware)
-        trigger_candle_interval_seconds: Seconds per trigger timeframe candle
-        cooldown_candles: Number of candles to cooldown (default 3)
+        last_signal_time: Timestamp of last sent signal (None if never).
+        current_time: Current time (timezone-aware).
+        trigger_candle_interval_seconds: Seconds per trigger timeframe candle.
+        cooldown_candles: Number of candles to cooldown (default 3).
 
     Returns:
-        True if cooldown is elapsed (signal allowed), False if still cooling down.
+        True if cooldown is elapsed (signal allowed),
+        False if still cooling down (block).
     """
     if last_signal_time is None:
         return True
@@ -60,6 +64,24 @@ def check_cooldown(
     elapsed_seconds = (current_time - last_signal_time).total_seconds()
 
     return elapsed_seconds >= cooldown_seconds
+
+
+def check_cooldown_from_timeframe(
+    last_signal_time: Optional[datetime],
+    trigger_timeframe: str,
+    cooldown_candles: int,
+    now: datetime,
+) -> bool:
+    """
+    Convenience wrapper: resolves a timeframe key to seconds and delegates
+    to check_cooldown. Returns True when cooldown is elapsed (allow).
+    """
+    from app.data_validation import TIMEFRAME_SECONDS
+    return check_cooldown(
+        last_signal_time, now,
+        TIMEFRAME_SECONDS[trigger_timeframe],
+        cooldown_candles,
+    )
 
 
 def check_stale_data(
@@ -88,27 +110,27 @@ def check_stale_data(
 def check_candle_closed(
     candle: Candle,
     current_time: datetime,
+    trigger_timeframe: str = "5m",
 ) -> bool:
     """
     Ensure the candle has actually closed before using it.
 
-    A candle is considered closed when its timestamp + interval < current_time.
+    A candle is considered closed when its timestamp + interval <= current_time.
     For 5M candles: candle timestamp is the OPEN time; close time = open + 5 min.
 
+    Deterministic: the decision depends only on candle boundary times.
+
     Args:
-        candle: The candidate trigger candle
-        current_time: Current time (timezone-aware)
+        candle: The candidate trigger candle.
+        current_time: Current time (timezone-aware).
+        trigger_timeframe: Timeframe key (\"5m\", \"15m\", \"1h\").
 
     Returns:
         True if candle is closed, False if still forming.
     """
-    # Heuristic: if candle timestamp + 1 candle interval <= current time, it's closed.
-    # For simplicity, check if the next candle's open time would be <= current time.
-    # In live context, if a newer candle exists, this candle is closed.
-    # For tests, we approximate: a 5M candle at time T is closed at T + 5 min.
-    from datetime import timedelta
-    # Assume 5-minute interval for trigger timeframe
-    close_time = candle.timestamp + timedelta(minutes=5)
+    from app.data_validation import TIMEFRAME_SECONDS
+    tf_seconds = TIMEFRAME_SECONDS[trigger_timeframe]
+    close_time = candle.timestamp + timedelta(seconds=tf_seconds)
     return close_time <= current_time
 
 

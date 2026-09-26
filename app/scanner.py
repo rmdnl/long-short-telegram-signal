@@ -9,6 +9,8 @@ PHASE 3 (dry-run) responsibilities:
 - Per-symbol decision with a primary REJECTION REASON when no signal
 - Signal observability (SIGNAL_GENERATED with full fields)
 - State: never re-evaluate the same closed 5M candle
+- Per-symbol cooldown gate (COOLDOWN_CANDLES x 5m trigger candles)
+- Per-symbol opposite-signal protection (only within the cooldown window)
 - Multi-symbol isolation: one bad symbol never aborts the scan
 
 No order creation. Signal-only.
@@ -18,11 +20,11 @@ from decimal import Decimal
 from typing import List, Dict, Optional, Set
 from datetime import datetime, timezone
 
-from app.models import Signal, Candle, IndicatorValues, MarketBias
+from app.models import Signal, Candle, IndicatorValues, MarketBias, SignalDirection
 from app.market_data import BinanceMarketData, MarketDataError, RateLimitError, TransientError
 from app.signal_engine import SignalEngine
 from app.config import get_config
-from app import indicators, strategy, data_validation
+from app import indicators, strategy, data_validation, signal_filter
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -43,6 +45,9 @@ REASON_STALE_DATA = "STALE_DATA"
 REASON_INVALID_DATA = "INVALID_DATA"
 REASON_MARKET_DATA_ERROR = "MARKET_DATA_ERROR"
 REASON_RATE_LIMITED = "RATE_LIMITED"
+REASON_COOLDOWN_ACTIVE = "COOLDOWN_ACTIVE"
+REASON_OPPOSITE_SIGNAL_BLOCKED = "OPPOSITE_SIGNAL_BLOCKED"
+REASON_CANDLE_NOT_CLOSED = "CANDLE_NOT_CLOSED"
 REASON_UNKNOWN = "UNKNOWN"
 
 
@@ -97,6 +102,11 @@ class Scanner:
         # state: symbol -> (last processed trigger candle ts, set of emitted signal ids)
         self._last_trigger_ts: Dict[str, datetime] = {}
         self._emitted_ids: Set[str] = set()
+        # Per-symbol cooldown / opposite-direction state.
+        # Last ACCEPTED signal's trigger candle OPEN time and direction, keyed
+        # by symbol. Only committed when a signal is actually accepted.
+        self._last_signal_time: Dict[str, datetime] = {}
+        self._last_signal_direction: Dict[str, SignalDirection] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -192,6 +202,19 @@ class Scanner:
         setup_ind = self._calc_indicators(setup_candles)
         trigger_ind = self._calc_indicators(trigger_candles)
 
+        # --- Cooldown + opposite-direction gate (production signal gate) ---
+        # Only a CONFIRMED closed trigger candle passes; any direction is blocked
+        # while the cooldown window is active. State is committed only when a
+        # signal is actually accepted below (restart-safe: SQLite is the
+        # source of truth for dedup; in-memory cooldown is re-derived on each
+        # restart from the last accepted signal's trigger candle open time).
+        gate_reason = self._direction_gate_reason(
+            symbol, trigger_candles[-1].timestamp,
+            self._bias(hf_ind, hf_candles),
+        )
+        if gate_reason is not None:
+            return self._reject(symbol, decision_time, gate_reason, now)
+
         # --- Decision reason classification (for observability) ---
         reason = self._classify_rejection(
             symbol, hf_ind, hf_candles, setup_ind, setup_candles,
@@ -212,6 +235,12 @@ class Scanner:
                 signal = None
             else:
                 self._emitted_ids.add(signal.signal_id)
+                # Commit per-symbol cooldown / direction state (restart-safe:
+                # the gate is re-applied on the next evaluation of this candle;
+                # if delivery later fails, the restart-safety path in main.py
+                # clears this state so the signal can be re-generated once).
+                self._last_signal_time[symbol] = signal.trigger_candle_time
+                self._last_signal_direction[symbol] = signal.direction
                 logger.info(
                     f"SIGNAL_GENERATED {symbol} {signal.direction.value} "
                     f"score={signal.score} entry={signal.entry_low}-{signal.entry_high} "
@@ -254,6 +283,137 @@ class Scanner:
         candles = self.market_data.fetch_klines(symbol, api_tf, limit=700)
         self.market_data.validate_candles(candles, tf=tf)
         return candles
+
+    def _direction_gate_reason(
+        self,
+        symbol: str,
+        latest_trigger_ts: datetime,
+        current_bias: MarketBias,
+    ) -> Optional[str]:
+        """
+        Production cooldown + opposite-direction gate.
+
+        COOLDOWN_CANDLES (default 3) × 5m trigger candles = 15 minutes.
+        While the window is active ANY new signal for the same symbol is
+        blocked (same-direction AND opposite-direction).
+
+        Deterministic: the gate compares closed-candle open times — the
+        last accepted signal's trigger candle open time (T_last) vs. the
+        latest closed trigger candle open time (T).  No wall-clock calls.
+
+        A new trigger candle T is allowed when:
+            (T - T_last) / tf_seconds > cooldown_candles
+
+        The reason code distinguishes same vs. opposite direction so logs
+        are actionable, but the gate outcome (block/allow) is identical.
+        """
+        last_time = self._last_signal_time.get(symbol)
+        if last_time is None:
+            return None
+
+        cooldown = self.config.cooldown_candles
+        if cooldown <= 0:
+            return None
+
+        # Cooldown is measured in CLOSED 5m trigger candles: both the last
+        # accepted signal's trigger candle open time and the current latest
+        # closed trigger candle open time share the same time base, so the
+        # elapsed candle count is exact and restart-deterministic.
+        #
+        # Delegates to signal_filter.check_cooldown so live mode uses the
+        # SAME boundary semantics as the backtest and the test suite
+        # (allow when elapsed >= cooldown_candles x 5m, i.e. `>=` not `>`).
+        if signal_filter.check_cooldown(
+            last_time,
+            latest_trigger_ts,
+            data_validation.TIMEFRAME_SECONDS["5m"],
+            cooldown,
+        ):
+            # Fully outside the cooldown window: allow (duplicate protection
+            # is handled separately by _emitted_ids / signal_exists).
+            return None
+
+        # Within the cooldown window: block.  Use the current 1H bias as a
+        # deterministic direction hint — the signal engine will emit a LONG
+        # only when bias is BULLISH and a SHORT only when bias is BEARISH.
+        last_dir = self._last_signal_direction.get(symbol)
+        hint = self._direction_hint_from_bias(current_bias)
+        if hint is not None and last_dir is not None and \
+           signal_filter.check_opposite_signal_protection(last_dir, hint):
+            return REASON_OPPOSITE_SIGNAL_BLOCKED
+        return REASON_COOLDOWN_ACTIVE
+
+    @staticmethod
+    def _direction_hint_from_bias(bias: MarketBias) -> Optional[SignalDirection]:
+        """Map the 1H bias to the direction the signal engine would emit."""
+        if bias == MarketBias.BULLISH:
+            return SignalDirection.LONG
+        if bias == MarketBias.BEARISH:
+            return SignalDirection.SHORT
+        return None
+
+    def restore_cooldown_state(self, rows) -> int:
+        """
+        Rehydrate per-symbol cooldown / direction state from SQLite.
+
+        Called once at startup. Without this, a restart would wipe the
+        in-memory cooldown state and immediately re-open the cooldown window
+        for every symbol, letting a restart double-signal the same setup.
+
+        Args:
+            rows: Iterable of (symbol, trigger_candle_time, direction) tuples
+                as returned by SignalStore.get_last_delivered_by_symbol().
+
+        Returns:
+            Number of symbols restored.
+        """
+        restored = 0
+        for symbol, trigger_ts, direction in rows:
+            ts = trigger_ts if isinstance(trigger_ts, datetime) else \
+                datetime.fromisoformat(trigger_ts)
+            self._last_signal_time[symbol] = ts
+            try:
+                self._last_signal_direction[symbol] = SignalDirection(direction)
+            except ValueError:
+                logger.warning(f"Unknown stored direction {direction!r} for {symbol}")
+            restored += 1
+        if restored:
+            logger.info(f"Restored cooldown state for {restored} symbol(s) from SQLite")
+        return restored
+
+    def clear_signal_state(self, symbol: str, signal_id: Optional[str] = None) -> None:
+        """
+        Reset per-symbol cooldown / direction state for restart-safety.
+
+        Called by main.py when a previously accepted signal FAILED to deliver
+        via Telegram so the signal can be re-generated exactly once on the
+        next scan (SQLite delivery state remains pending/failed until a
+        retry succeeds, preventing duplicate sends).
+
+        Only resets the state for the given symbol. Other symbols' cooldown,
+        direction and dedup state are untouched (multi-symbol isolation).
+
+        Args:
+            symbol: Symbol whose cooldown/gate state is reset.
+            signal_id: Optional failed signal id to drop from the in-memory
+                dedup set so the retry regenerating the identical id is not
+                suppressed. Other ids are preserved.
+        """
+        self._last_signal_time.pop(symbol, None)
+        self._last_signal_direction.pop(symbol, None)
+        self._last_trigger_ts.pop(symbol, None)
+        # Signal ids are deterministic (symbol + trigger candle open time),
+        # so the in-memory dedup set must NOT be polluted by a failed send:
+        # the retry will regenerate the identical id. Drop only this id;
+        # other symbols' (and this symbol's older) ids stay suppressed.
+        if signal_id is not None:
+            self._emitted_ids.discard(signal_id)
+        else:
+            # Backwards-compatible fallback: drop this symbol's ids only.
+            self._emitted_ids = {
+                sid for sid in self._emitted_ids
+                if not sid.startswith(f"{symbol}|")
+            }
 
     def _reject(self, symbol: str, decision_time: Optional[datetime],
                 reason: str, now: datetime) -> ScanDecision:
